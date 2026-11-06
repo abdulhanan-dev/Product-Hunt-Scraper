@@ -580,3 +580,35 @@ def test_database_upsert_comments_reviews_profiles():
     upsert_profile(mock_db, {"username": "alice", "name": "Alice"})
     assert mock_db.profiles.update_one.call_count == 1
 
+
+def test_auto_hash_extraction_on_expired_hash(mocker):
+    from scraper import fetch_daily_leaderboard
+
+    mock_client = MagicMock()
+    # First attempt fails with 'This request could not be processed'
+    # Second attempt succeeds with new hash
+    mock_client.execute_query.side_effect = [
+        RuntimeError("GraphQL returned errors: ['This request could not be processed']"),
+        {
+            "data": {
+                "dailyLeaderboard": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "edges": [{"node": {"id": "1", "slug": "test", "__typename": "Post"}}],
+                }
+            }
+        },
+    ]
+
+    mock_extractor = mocker.patch("extract_hashes.extract_hashes_and_cookies")
+    mock_extractor.return_value = ({"LeaderboardDailyPage": "fresh_new_hash_123"}, "dummy_cookie")
+
+    launches = fetch_daily_leaderboard(
+        mock_client, target_date="2026-11-04", operation_hash="expired_hash"
+    )
+
+    assert len(launches) == 1
+    assert mock_extractor.call_count == 1
+    assert mock_client.execute_query.call_count == 2
+    # Second call should have used the fresh hash
+    assert mock_client.execute_query.call_args_list[1][1]["sha256_hash"] == "fresh_new_hash_123"
+

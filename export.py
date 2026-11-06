@@ -68,3 +68,4 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=str, default="storage", help="Output directory")
     args = parser.parse_args()
     export_data(target_date=args.date, output_dir=args.out)
+

@@ -14,8 +14,14 @@ from utils import get_logger
 logger = get_logger("extract_hashes")
 
 
-def extract_hashes_and_cookies(url: str = "https://www.producthunt.com/leaderboard/daily", timeout: int = 60) -> None:
-    """Launch visible browser, wait for user to interact, and capture GraphQL hashes."""
+def extract_hashes_and_cookies(
+    url: str = "https://www.producthunt.com/leaderboard/daily", timeout: int = 60
+) -> tuple[dict[str, str], str]:
+    """Launch visible browser, wait for user to interact, and capture GraphQL hashes.
+
+    Returns:
+        tuple: (captured_hashes_dict, cookie_string)
+    """
     print("\n=======================================================")
     print("      PRODUCT HUNT HASH & COOKIE EXTRACTION HELPER     ")
     print("=======================================================")
@@ -136,6 +142,7 @@ def extract_hashes_and_cookies(url: str = "https://www.producthunt.com/leaderboa
             print(f"[!] Could not update .env: {exc}")
 
     print("=======================================================\n")
+    return captured_hashes, captured_cookies
 
 
 def update_env_file(leaderboard_hash: str = None, cookie_str: str = None) -> None:
@@ -172,3 +179,4 @@ def update_env_file(leaderboard_hash: str = None, cookie_str: str = None) -> Non
 
 if __name__ == "__main__":
     extract_hashes_and_cookies()
+

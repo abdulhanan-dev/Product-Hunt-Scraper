@@ -39,6 +39,18 @@ def fetch_daily_leaderboard(
     cursor: Optional[str] = None
     page_num = 1
 
+    # Auto-extract if hash is completely missing
+    if not hash_to_use:
+        logger.warning("No Leaderboard hash configured. Automatically launching hash extractor...")
+        try:
+            from extract_hashes import extract_hashes_and_cookies
+            extracted, cookies = extract_hashes_and_cookies()
+            hash_to_use = extracted.get("LeaderboardDailyPage")
+            if cookies:
+                client.client.headers["Cookie"] = cookies
+        except Exception as exc:
+            logger.error("Auto extraction failed: %s", exc)
+
     try:
         parts = [int(p) for p in target_date.split("-")]
         year, month, day = parts[0], parts[1], parts[2]
@@ -61,11 +73,35 @@ def fetch_daily_leaderboard(
             cursor or "START",
         )
 
-        response = client.execute_query(
-            operation_name="LeaderboardDailyPage",
-            variables=variables,
-            sha256_hash=hash_to_use,
-        )
+        try:
+            response = client.execute_query(
+                operation_name="LeaderboardDailyPage",
+                variables=variables,
+                sha256_hash=hash_to_use,
+            )
+        except Exception as exc:
+            err_msg = str(exc)
+            if "This request could not be processed" in err_msg or "PersistedQuery" in err_msg:
+                logger.warning(
+                    "Persisted hash expired or rejected ('%s'). Automatically launching extractor to refresh...",
+                    err_msg,
+                )
+                from extract_hashes import extract_hashes_and_cookies
+                extracted, cookies = extract_hashes_and_cookies()
+                new_hash = extracted.get("LeaderboardDailyPage")
+                if new_hash:
+                    hash_to_use = new_hash
+                if cookies:
+                    client.client.headers["Cookie"] = cookies
+
+                # Retry query with fresh hash
+                response = client.execute_query(
+                    operation_name="LeaderboardDailyPage",
+                    variables=variables,
+                    sha256_hash=hash_to_use,
+                )
+            else:
+                raise
 
         launches, has_next_page, end_cursor = parse_leaderboard_page(response, target_date)
         all_launches.extend(launches)
