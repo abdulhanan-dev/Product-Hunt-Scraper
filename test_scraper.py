@@ -409,3 +409,174 @@ def test_upsert_product_entities():
     assert bw_count == 1
     assert mock_db.product_built_with.update_one.call_count == 1
 
+
+# --- 6. Stage 3: Comments, Reviews, and Profiles Tests ---
+
+def test_parse_comments_with_nested_replies():
+    from parsers import parse_comments_page
+
+    payload = {
+        "data": {
+            "comments": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "edges": [
+                    {
+                        "node": {
+                            "id": "c_1",
+                            "bodyHtml": "<p>Great launch!</p>",
+                            "votesCount": 5,
+                            "user": {"id": "u_1", "username": "alice", "name": "Alice"},
+                            "replies": {
+                                "edges": [
+                                    {
+                                        "node": {
+                                            "id": "c_2",
+                                            "bodyHtml": "<p>Thanks Alice!</p>",
+                                            "user": {"id": "u_2", "username": "bob", "name": "Bob"},
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    }
+                ],
+            }
+        }
+    }
+
+    comments, has_next, end_cursor, users = parse_comments_page(
+        payload, product_id="prod_100", post_slug="my-launch"
+    )
+
+    assert len(comments) == 2
+    # Parent comment
+    assert comments[0]["comment_id"] == "c_1"
+    assert comments[0]["parent_comment_id"] is None
+    assert comments[0]["author_username"] == "alice"
+    assert comments[0]["votes_count"] == 5
+
+    # Nested reply
+    assert comments[1]["comment_id"] == "c_2"
+    assert comments[1]["parent_comment_id"] == "c_1"
+    assert comments[1]["author_username"] == "bob"
+
+    assert users == {"alice", "bob"}
+    assert has_next is False
+
+
+def test_detailed_reviews_count_and_gate():
+    from parsers import parse_detailed_reviews_count
+    from scraper import fetch_product_reviews
+
+    # Case 1: Count is 0
+    zero_payload = {"data": {"product": {"detailedReviewsCount": 0}}}
+    assert parse_detailed_reviews_count(zero_payload) == 0
+
+    mock_client = MagicMock()
+    mock_client.execute_query.return_value = zero_payload
+
+    reviews, users = fetch_product_reviews(
+        mock_client, product_slug="zero-review-app", product_id="p0"
+    )
+    assert reviews == []
+    assert users == set()
+    # Ensure feed query was never called (only 1 call for count)
+    assert mock_client.execute_query.call_count == 1
+
+
+def test_parse_detailed_reviews_feed():
+    from parsers import parse_detailed_reviews_feed
+
+    payload = {
+        "data": {
+            "reviewsPage": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "edges": [
+                    {
+                        "node": {
+                            "id": "rev_55",
+                            "reviewType": "detailed",
+                            "rating": 5,
+                            "feedback": "Loving this tool!",
+                            "pros": ["Easy setup"],
+                            "cons": [],
+                            "user": {"id": "u_rev", "username": "reviewer_dan"},
+                        }
+                    }
+                ],
+            }
+        }
+    }
+
+    reviews, has_next, end_cursor, users = parse_detailed_reviews_feed(
+        payload, product_id="prod_100"
+    )
+    assert len(reviews) == 1
+    assert reviews[0]["review_id"] == "rev_55"
+    assert reviews[0]["rating"] == 5
+    assert reviews[0]["author_username"] == "reviewer_dan"
+    assert users == {"reviewer_dan"}
+
+
+def test_parse_profile_ssr():
+    from parsers import parse_profile_ssr
+
+    sample_html = """
+    <!DOCTYPE html>
+    <html>
+    <head><title>John Doe on Product Hunt</title></head>
+    <body>
+    <script>
+    window.__APOLLO_STATE__ = {
+      "data": {
+        "profile": {
+          "id": "u_999",
+          "name": "John Doe",
+          "headline": "Maker & Founder",
+          "about": "Building cool tools",
+          "isMaker": true,
+          "isVerified": true,
+          "streak": 14,
+          "kittyCoins": 1500,
+          "socialLinks": {
+            "twitter": "https://twitter.com/johndoe",
+            "website": {
+              "encodedUrl": "aHR0cHM6Ly9qb2huZG9lLmNvbQ=="
+            }
+          }
+        }
+      }
+    };
+    </script>
+    </body>
+    </html>
+    """
+
+    profile = parse_profile_ssr(sample_html, username="johndoe")
+    assert profile is not None
+    assert profile["username"] == "johndoe"
+    assert profile["user_id"] == "u_999"
+    assert profile["name"] == "John Doe"
+    assert profile["is_maker"] is True
+    assert profile["is_verified"] is True
+    assert profile["streak"] == 14
+    assert profile["kitty_coins"] == 1500
+    assert profile["social_links"]["twitter"] == "https://twitter.com/johndoe"
+    # Base64 decoded URL:
+    assert profile["social_links"]["website"] == "https://johndoe.com"
+
+
+def test_database_upsert_comments_reviews_profiles():
+    from database import upsert_comment, upsert_profile, upsert_review
+
+    mock_db = MagicMock()
+
+    upsert_comment(mock_db, {"comment_id": "c1", "body_html": "hi"})
+    assert mock_db.comments.update_one.call_count == 1
+
+    upsert_review(mock_db, {"review_id": "r1", "rating": 5})
+    assert mock_db.reviews.update_one.call_count == 1
+
+    upsert_profile(mock_db, {"username": "alice", "name": "Alice"})
+    assert mock_db.profiles.update_one.call_count == 1
+

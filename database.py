@@ -167,6 +167,63 @@ def upsert_product_built_with(db: Database, items: List[Dict[str, Any]]) -> int:
     return count
 
 
+def upsert_comment(db: Database, comment: Dict[str, Any]) -> None:
+    """Idempotently insert or update a launch comment."""
+    comment_id = str(comment.get("comment_id", ""))
+    if not comment_id:
+        return
+    comment["updated_at"] = datetime.now(timezone.utc).isoformat()
+    db.comments.update_one(
+        {"comment_id": comment_id},
+        {"$set": comment},
+        upsert=True,
+    )
+
+
+def upsert_comments(db: Database, comments: List[Dict[str, Any]]) -> int:
+    """Upsert a list of launch comments."""
+    count = 0
+    for c in comments:
+        upsert_comment(db, c)
+        count += 1
+    return count
+
+
+def upsert_review(db: Database, review: Dict[str, Any]) -> None:
+    """Idempotently insert or update a product review."""
+    review_id = str(review.get("review_id", ""))
+    if not review_id:
+        return
+    review["updated_at"] = datetime.now(timezone.utc).isoformat()
+    db.reviews.update_one(
+        {"review_id": review_id},
+        {"$set": review},
+        upsert=True,
+    )
+
+
+def upsert_reviews(db: Database, reviews: List[Dict[str, Any]]) -> int:
+    """Upsert a list of product reviews."""
+    count = 0
+    for r in reviews:
+        upsert_review(db, r)
+        count += 1
+    return count
+
+
+def upsert_profile(db: Database, profile: Dict[str, Any]) -> None:
+    """Idempotently insert or update a user public profile."""
+    username = profile.get("username", "")
+    if not username:
+        return
+    profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+    db.profiles.update_one(
+        {"username": username.lower()},
+        {"$set": profile},
+        upsert=True,
+    )
+
+
 def record_run_start(db: Database, run_id: str, target_date: str) -> None:
     """Record the start of a scraper run."""
     db.scraper_runs.update_one(

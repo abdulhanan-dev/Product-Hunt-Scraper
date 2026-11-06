@@ -1,18 +1,25 @@
 """Scraper module for Stage 1: Daily Leaderboard."""
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from client import GraphQLClient
 from config import (
+    HASH_DETAILED_REVIEWS_FEED,
+    HASH_DETAILED_REVIEWS_PAGE,
     HASH_PRODUCT_ABOUT_PAGE,
     HASH_PRODUCT_BUILT_WITH_PAGE,
+    HASH_PRODUCT_COMMENTS,
     HASH_PRODUCTS_PAGE_LAYOUT,
     settings,
 )
 from parsers import (
+    parse_comments_page,
+    parse_detailed_reviews_count,
+    parse_detailed_reviews_feed,
     parse_leaderboard_page,
     parse_product_about,
     parse_product_built_with,
     parse_product_layout,
+    parse_profile_ssr,
 )
 from utils import get_logger
 
@@ -143,4 +150,138 @@ def enrich_product(
         logger.warning("Failed to fetch built-with for product %s: %s", product_slug, exc)
 
     return product_data, media_items, people, built_with
+
+
+def fetch_product_comments(
+    client: GraphQLClient,
+    post_slug: str,
+    product_id: str,
+) -> Tuple[List[Dict[str, Any]], Set[str]]:
+    """Retrieve all comments and nested replies for a launch post using post_slug."""
+    logger.info("Fetching comments for post_slug: %s (product_id: %s)", post_slug, product_id)
+    all_comments: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    discovered_users: Set[str] = set()
+    cursor: Optional[str] = None
+    page = 1
+
+    while True:
+        variables: Dict[str, Any] = {"slug": post_slug}
+        if cursor:
+            variables["after"] = cursor
+
+        try:
+            resp = client.execute_query(
+                operation_name="ProductPageLaunchingTodayComments",
+                variables=variables,
+                sha256_hash=HASH_PRODUCT_COMMENTS,
+            )
+            comments, has_next, end_cursor, users = parse_comments_page(
+                resp, product_id=product_id, post_slug=post_slug
+            )
+            discovered_users.update(users)
+
+            for c in comments:
+                cid = c["comment_id"]
+                if cid not in seen_ids:
+                    seen_ids.add(cid)
+                    all_comments.append(c)
+
+            if not has_next or not end_cursor or end_cursor == cursor:
+                break
+            cursor = end_cursor
+            page += 1
+        except Exception as exc:
+            logger.warning("Failed to fetch comments page %d for %s: %s", page, post_slug, exc)
+            break
+
+    logger.info("Retrieved %d unique comments for post_slug: %s", len(all_comments), post_slug)
+    return all_comments, discovered_users
+
+
+def fetch_product_reviews(
+    client: GraphQLClient,
+    product_slug: str,
+    product_id: str,
+) -> Tuple[List[Dict[str, Any]], Set[str]]:
+    """Retrieve detailed reviews after verifying detailedReviewsCount > 0."""
+    logger.info("Checking detailed review count for product_slug: %s", product_slug)
+    all_reviews: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    discovered_users: Set[str] = set()
+
+    # Step 1: Check review count gate
+    review_count = 0
+    try:
+        count_resp = client.execute_query(
+            operation_name="DetailedReviewsPage",
+            variables={"slug": product_slug},
+            sha256_hash=HASH_DETAILED_REVIEWS_PAGE,
+        )
+        review_count = parse_detailed_reviews_count(count_resp)
+    except Exception as exc:
+        logger.warning("Failed to check review count for %s: %s", product_slug, exc)
+
+    logger.info("Detailed reviews count for %s: %d", product_slug, review_count)
+    if review_count <= 0:
+        logger.info("Skipping review feed for %s (count is 0)", product_slug)
+        return [], discovered_users
+
+    # Step 2: Fetch review feed
+    cursor: Optional[str] = None
+    page = 1
+    while True:
+        variables: Dict[str, Any] = {"slug": product_slug}
+        if cursor:
+            variables["after"] = cursor
+
+        try:
+            feed_resp = client.execute_query(
+                operation_name="DetailedReviewsFeedQuery",
+                variables=variables,
+                sha256_hash=HASH_DETAILED_REVIEWS_FEED,
+            )
+            reviews, has_next, end_cursor, users = parse_detailed_reviews_feed(
+                feed_resp, product_id=product_id
+            )
+            discovered_users.update(users)
+
+            for r in reviews:
+                rid = r["review_id"]
+                if rid not in seen_ids:
+                    seen_ids.add(rid)
+                    all_reviews.append(r)
+
+            if not has_next or not end_cursor or end_cursor == cursor:
+                break
+            cursor = end_cursor
+            page += 1
+        except Exception as exc:
+            logger.warning("Failed to fetch review feed page %d for %s: %s", page, product_slug, exc)
+            break
+
+    logger.info("Retrieved %d unique reviews for product_slug: %s", len(all_reviews), product_slug)
+    return all_reviews, discovered_users
+
+
+def fetch_user_profile(client: GraphQLClient, username: str) -> Optional[Dict[str, Any]]:
+    """Retrieve public profile data for a username by parsing SSR HTML."""
+    clean_username = username.strip().lstrip("@")
+    if not clean_username:
+        return None
+
+    profile_url = f"https://www.producthunt.com/@{clean_username}"
+    logger.info("Fetching user profile for @%s", clean_username)
+
+    client._apply_delay()
+    try:
+        resp = client.client.get(profile_url)
+        if resp.status_code == 404:
+            logger.info("Profile not found (404) for @%s", clean_username)
+            return None
+        resp.raise_for_status()
+        return parse_profile_ssr(resp.text, username=clean_username)
+    except Exception as exc:
+        logger.warning("Failed to fetch profile for @%s: %s", clean_username, exc)
+        return None
 
