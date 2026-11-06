@@ -73,3 +73,4 @@ if __name__ == "__main__":
     parser.add_argument("--date", type=str, default="", help="Optional target date to filter")
     args = parser.parse_args()
     validate_database(args.date)
+

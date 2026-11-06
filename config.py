@@ -27,6 +27,10 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="PRODUCT_HUNT_COOKIE",
     )
+    product_hunt_leaderboard_hash: str = Field(
+        default="8a8f3bb6637e2cccfdc7898eb071e994f64e6f8e49c73475363da7858d919bd3",
+        validation_alias="PRODUCT_HUNT_LEADERBOARD_HASH",
+    )
 
     # MongoDB
     mongodb_uri: str = Field(
@@ -58,6 +62,7 @@ class Settings(BaseSettings):
 
 
 # Persisted Query SHA-256 Hashes
+HASH_LEADERBOARD_DAILY = "8a8f3bb6637e2cccfdc7898eb071e994f64e6f8e49c73475363da7858d919bd3"
 HASH_PRODUCTS_PAGE_LAYOUT = "2c1bdf022d6d3945357e8933d65d7b1d76435e973d9046b06405928ba5225ca3"
 HASH_PRODUCT_ABOUT_PAGE = "13c8d08dec1bf9edf9ecd53237ab781429bc8fea8016ca025ec9ac82fc6044bb"
 HASH_PRODUCT_BUILT_WITH_PAGE = "3d3ad8ce5c601c4eeb6bd27a5bd05c28d0809e80540e3082a14db866403b73b1"

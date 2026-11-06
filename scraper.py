@@ -34,18 +34,26 @@ def fetch_daily_leaderboard(
     """Retrieve all featured launches for target_date across all cursor pages."""
     logger.info("Fetching daily leaderboard for date: %s", target_date)
 
+    hash_to_use = operation_hash or settings.product_hunt_leaderboard_hash
     all_launches: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
     page_num = 1
 
+    try:
+        parts = [int(p) for p in target_date.split("-")]
+        year, month, day = parts[0], parts[1], parts[2]
+    except Exception:
+        raise ValueError(f"Invalid target_date format '{target_date}'. Expected YYYY-MM-DD.")
+
     while True:
         variables: Dict[str, Any] = {
             "featured": True,
-            "date": target_date,
+            "year": year,
+            "month": month,
+            "day": day,
             "order": "DAILY_RANK",
+            "cursor": cursor,
         }
-        if cursor:
-            variables["after"] = cursor
 
         logger.info(
             "Fetching leaderboard page %d (cursor=%s)",
@@ -56,7 +64,7 @@ def fetch_daily_leaderboard(
         response = client.execute_query(
             operation_name="LeaderboardDailyPage",
             variables=variables,
-            sha256_hash=operation_hash,
+            sha256_hash=hash_to_use,
         )
 
         launches, has_next_page, end_cursor = parse_leaderboard_page(response, target_date)
@@ -121,7 +129,7 @@ def enrich_product(
 
     # 2. Product About (media, makers, hunters, pricing)
     try:
-        about_vars = {"slug": product_slug}
+        about_vars = {"productSlug": product_slug}
         about_resp = client.execute_query(
             operation_name="ProductAboutPage",
             variables=about_vars,
@@ -166,9 +174,9 @@ def fetch_product_comments(
     page = 1
 
     while True:
-        variables: Dict[str, Any] = {"slug": post_slug}
+        variables: Dict[str, Any] = {"postSlug": post_slug}
         if cursor:
-            variables["after"] = cursor
+            variables["cursor"] = cursor
 
         try:
             resp = client.execute_query(
@@ -215,7 +223,7 @@ def fetch_product_reviews(
     try:
         count_resp = client.execute_query(
             operation_name="DetailedReviewsPage",
-            variables={"slug": product_slug},
+            variables={"slug": product_slug, "commentsListSubjectThreadsLimit": 10},
             sha256_hash=HASH_DETAILED_REVIEWS_PAGE,
         )
         review_count = parse_detailed_reviews_count(count_resp)
@@ -231,9 +239,13 @@ def fetch_product_reviews(
     cursor: Optional[str] = None
     page = 1
     while True:
-        variables: Dict[str, Any] = {"slug": product_slug}
+        variables: Dict[str, Any] = {
+            "slug": product_slug,
+            "reviewsLimit": 10,
+            "commentsListSubjectThreadsLimit": 10,
+        }
         if cursor:
-            variables["after"] = cursor
+            variables["cursor"] = cursor
 
         try:
             feed_resp = client.execute_query(

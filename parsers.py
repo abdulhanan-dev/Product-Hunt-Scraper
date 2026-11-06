@@ -15,9 +15,9 @@ def parse_leaderboard_page(
     """
     data = payload.get("data") or {}
 
-    # Locate the connection node (e.g. posts, dailyLeaderboard, leaderboard)
+    # Locate the connection node (e.g. homefeedItems, posts, dailyLeaderboard, leaderboard)
     connection = None
-    for key in ["dailyLeaderboard", "posts", "leaderboard", "viewer"]:
+    for key in ["homefeedItems", "dailyLeaderboard", "posts", "leaderboard", "viewer"]:
         if key in data and isinstance(data[key], dict):
             if "edges" in data[key] or "pageInfo" in data[key]:
                 connection = data[key]
@@ -88,11 +88,22 @@ def parse_leaderboard_page(
             "product_slug": product_slug,
             "name": node.get("name", ""),
             "tagline": node.get("tagline", ""),
-            "score": node.get("votesCount") or node.get("score") or node.get("points") or 0,
-            "rank": node.get("rank") or node.get("dailyRank"),
+            "score": (
+                node.get("launchDayScore")
+                or node.get("latestScore")
+                or node.get("votesCount")
+                or node.get("score")
+                or node.get("points")
+                or 0
+            ),
+            "rank": node.get("dailyRank") or node.get("rank"),
             "comments_count": node.get("commentsCount", 0),
             "topics": [t for t in topics if t],
-            "logo_uuid": node.get("logoUuid") or (node.get("thumbnail") or {}).get("url"),
+            "logo_uuid": (
+                node.get("thumbnailImageUuid")
+                or node.get("logoUuid")
+                or (node.get("thumbnail") or {}).get("url")
+            ),
             "shortened_url": node.get("shortenedUrl") or node.get("url"),
             "featured_at": node.get("featuredAt"),
             "weekly_rank": node.get("weeklyRank"),
@@ -283,13 +294,18 @@ def parse_comments_page(
     """
     data = payload.get("data") or {}
     comments_node = None
-    for key in ["comments", "post", "launchingToday"]:
-        if key in data and isinstance(data[key], dict):
-            if "edges" in data[key] or "pageInfo" in data[key]:
+
+    post_obj = data.get("post") or {}
+    if isinstance(post_obj, dict):
+        if "threads" in post_obj and isinstance(post_obj["threads"], dict):
+            comments_node = post_obj["threads"]
+        elif "comments" in post_obj and isinstance(post_obj["comments"], dict):
+            comments_node = post_obj["comments"]
+
+    if not comments_node:
+        for key in ["comments", "threads", "launchingToday"]:
+            if key in data and isinstance(data[key], dict):
                 comments_node = data[key]
-                break
-            if "comments" in data[key] and isinstance(data[key]["comments"], dict):
-                comments_node = data[key]["comments"]
                 break
 
     if not comments_node:
@@ -390,13 +406,17 @@ def parse_detailed_reviews_feed(
     data = payload.get("data") or {}
     reviews_node = None
 
-    for key in ["reviewsPage", "reviews", "product"]:
-        if key in data and isinstance(data[key], dict):
-            if "edges" in data[key] or "pageInfo" in data[key]:
+    product_obj = data.get("product") or {}
+    if isinstance(product_obj, dict):
+        if "detailedReviews" in product_obj and isinstance(product_obj["detailedReviews"], dict):
+            reviews_node = product_obj["detailedReviews"]
+        elif "reviews" in product_obj and isinstance(product_obj["reviews"], dict):
+            reviews_node = product_obj["reviews"]
+
+    if not reviews_node:
+        for key in ["reviewsPage", "reviews", "detailedReviews"]:
+            if key in data and isinstance(data[key], dict):
                 reviews_node = data[key]
-                break
-            if "reviews" in data[key] and isinstance(data[key]["reviews"], dict):
-                reviews_node = data[key]["reviews"]
                 break
 
     if not reviews_node:
@@ -432,10 +452,15 @@ def parse_detailed_reviews_feed(
             "product_id": product_id,
             "review_type": node.get("reviewType", ""),
             "created_at": node.get("createdAt"),
-            "rating": node.get("rating") or node.get("score"),
-            "feedback": node.get("feedback") or node.get("body", ""),
-            "pros": node.get("pros") or node.get("selectedPros") or [],
-            "cons": node.get("cons") or node.get("selectedCons") or [],
+            "rating": node.get("overallRating") or node.get("rating") or node.get("score"),
+            "feedback": (
+                node.get("overallExperience")
+                or node.get("positiveFeedback")
+                or node.get("feedback")
+                or node.get("body", "")
+            ),
+            "pros": node.get("selectedPros") or node.get("pros") or [],
+            "cons": node.get("selectedCons") or node.get("cons") or [],
             "alternative_products": node.get("alternativeProducts") or [],
             "votes_count": node.get("votesCount", 0),
             "author_username": username,
