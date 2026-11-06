@@ -25,9 +25,9 @@ class GraphQLClient:
         self.base_url = base_url or settings.product_hunt_graphql_url
         self.bearer_token = bearer_token or settings.product_hunt_bearer_token
         self.cookie = cookie or settings.product_hunt_cookie
-        self.timeout = timeout or settings.request_timeout_seconds
-        self.max_retries = max_retries or settings.max_retries
-        self.delay = delay or settings.request_delay_seconds
+        self.timeout = timeout if timeout is not None else settings.request_timeout_seconds
+        self.max_retries = max_retries if max_retries is not None else settings.max_retries
+        self.delay = delay if delay is not None else settings.request_delay_seconds
         self._last_request_time = 0.0
 
         # Build default headers without leaking credentials
@@ -92,29 +92,44 @@ class GraphQLClient:
                 response = self.client.get(self.base_url, params=params)
                 self._last_request_time = time.time()
 
-                # Handle Rate Limiting (429)
+                # Handle Rate Limiting (429) with Exponential Backoff up to max_retries
                 if response.status_code == 429:
-                    retry_after = float(response.headers.get("Retry-After", backoff))
+                    if attempt > self.max_retries:
+                        raise RuntimeError(
+                            f"Rate limit (429) persisted after {self.max_retries} retries for {operation_name}"
+                        )
+                    retry_header = response.headers.get("Retry-After")
+                    try:
+                        retry_after = float(retry_header) if retry_header else 0.0
+                    except ValueError:
+                        retry_after = 0.0
+                    wait_time = max(retry_after, backoff)
                     logger.warning(
-                        "Rate limited (429) on %s. Backing off for %.1fs",
+                        "Rate limited (429) on %s (attempt %d/%d). Exponential backoff: waiting %.1fs...",
                         operation_name,
-                        retry_after,
+                        attempt,
+                        self.max_retries,
+                        wait_time,
                     )
-                    time.sleep(retry_after)
-                    backoff *= 2
+                    time.sleep(wait_time)
+                    backoff = min(backoff * 2, 60.0)
                     continue
 
                 # Handle 403 Forbidden (Cloudflare session refresh)
                 if response.status_code == 403:
+                    if attempt > self.max_retries:
+                        raise RuntimeError(f"Access forbidden (403) for {operation_name}")
                     logger.warning(
                         "Received 403 Forbidden on %s. Launching browser to refresh session...",
                         operation_name,
                     )
                     try:
                         from extract_hashes import extract_hashes_and_cookies
-                        extracted, cookies = extract_hashes_and_cookies()
+                        extracted, cookies, ua = extract_hashes_and_cookies()
                         if cookies:
                             self.client.headers["Cookie"] = cookies
+                        if ua:
+                            self.client.headers["User-Agent"] = ua
                         if operation_name in extracted:
                             new_hash = extracted[operation_name]
                             extensions = {"persistedQuery": {"version": 1, "sha256Hash": new_hash}}
@@ -125,14 +140,18 @@ class GraphQLClient:
 
                 # Handle Server Errors (5xx)
                 if 500 <= response.status_code < 600:
+                    if attempt > self.max_retries:
+                        response.raise_for_status()
                     logger.warning(
-                        "Server error (%d) on %s attempt %d. Retrying...",
+                        "Server error (%d) on %s (attempt %d/%d). Retrying in %.1fs...",
                         response.status_code,
                         operation_name,
                         attempt,
+                        self.max_retries,
+                        backoff,
                     )
                     time.sleep(backoff)
-                    backoff *= 2
+                    backoff = min(backoff * 2, 60.0)
                     continue
 
                 response.raise_for_status()

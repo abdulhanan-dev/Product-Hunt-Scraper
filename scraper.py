@@ -350,6 +350,22 @@ def fetch_user_profile(
                 logger.info("Profile not found (404) for @%s", clean_username)
                 return None
 
+            if resp.status_code == 429:
+                retry_hdr = resp.headers.get("Retry-After")
+                try:
+                    retry_wait = float(retry_hdr) if retry_hdr else 2.0
+                except ValueError:
+                    retry_wait = 2.0
+                wait = max(retry_wait, 2.0 * (2**attempt))
+                logger.warning(
+                    "Rate limited (429) fetching profile for @%s. Backing off for %.1fs...",
+                    clean_username,
+                    wait,
+                )
+                import time
+                time.sleep(wait)
+                continue
+
             if resp.status_code == 403:
                 if not _browser_cookie_refresh_done and attempt < max_auth_retries:
                     _browser_cookie_refresh_done = True

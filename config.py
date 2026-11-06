@@ -48,7 +48,7 @@ class Settings(BaseSettings):
         validation_alias="REQUEST_TIMEOUT_SECONDS",
     )
     max_retries: int = Field(
-        default=3,
+        default=5,
         validation_alias="MAX_RETRIES",
     )
     request_delay_seconds: float = Field(

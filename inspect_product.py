@@ -97,3 +97,4 @@ if __name__ == "__main__":
     parser.add_argument("--slug", type=str, default="", help="Product slug (e.g. floot, prelulu)")
     args = parser.parse_args()
     inspect_product(slug=args.slug)
+

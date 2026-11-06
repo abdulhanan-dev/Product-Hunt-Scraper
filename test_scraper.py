@@ -683,3 +683,33 @@ def test_product_deduplication_skips_existing(mocker):
     # Because product already exists, enrich_product should NOT be called!
     assert mock_enrich.call_count == 0
 
+
+def test_rate_limit_429_exponential_backoff_and_retries(mocker):
+    from client import GraphQLClient
+
+    client = GraphQLClient(max_retries=5, delay=0.0)
+    mock_sleep = mocker.patch("time.sleep")
+
+    # Mock responses: 3x 429 rate limit, then 1x 200 OK
+    resp_429_1 = MagicMock(status_code=429, headers={"Retry-After": "2"})
+    resp_429_2 = MagicMock(status_code=429, headers={})
+    resp_429_3 = MagicMock(status_code=429, headers={"Retry-After": "4"})
+    resp_200 = MagicMock(status_code=200)
+    resp_200.json.return_value = {"data": {"test": "success"}}
+
+    mocker.patch.object(
+        client.client, "get", side_effect=[resp_429_1, resp_429_2, resp_429_3, resp_200]
+    )
+
+    data = client.execute_query("TestQuery", {"param": 1})
+
+    assert data == {"data": {"test": "success"}}
+    # Ensure sleep was called for backoff 3 times
+    assert mock_sleep.call_count == 3
+    # Check that wait times followed exponential backoff / Retry-After
+    waits = [call[0][0] for call in mock_sleep.call_args_list]
+    assert waits[0] == 2.0  # From Retry-After: 2
+    assert waits[1] == 2.0  # From backoff (1.0 * 2)
+    assert waits[2] == 4.0  # From Retry-After: 4 / backoff
+    assert client.client.get.call_count == 4
+
