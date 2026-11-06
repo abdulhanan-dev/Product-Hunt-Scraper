@@ -1,5 +1,6 @@
 """Scraper module for Stage 1: Daily Leaderboard."""
 
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from client import GraphQLClient
 from config import (
@@ -148,54 +149,78 @@ def enrich_product(
     people: List[Dict[str, Any]] = []
     built_with: List[Dict[str, Any]] = []
 
-    # 1. Product Layout / Details
-    try:
-        layout_vars = {
-            "slug": product_slug,
-            "includeAlternatives": True,
-            "launchSlug": None,
-        }
-        layout_resp = client.execute_query(
-            operation_name="ProductsPageLayout",
-            variables=layout_vars,
-            sha256_hash=HASH_PRODUCTS_PAGE_LAYOUT,
-        )
-        product_data = parse_product_layout(layout_resp)
-    except Exception as exc:
-        logger.warning("Failed to fetch layout for product %s: %s", product_slug, exc)
+    # 1. Product Layout / Details (with retry to ensure no missed data)
+    for attempt in range(1, 4):
+        try:
+            layout_vars = {
+                "slug": product_slug,
+                "includeAlternatives": True,
+                "launchSlug": None,
+            }
+            layout_resp = client.execute_query(
+                operation_name="ProductsPageLayout",
+                variables=layout_vars,
+                sha256_hash=HASH_PRODUCTS_PAGE_LAYOUT,
+            )
+            product_data = parse_product_layout(layout_resp)
+            break
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch layout for product %s (attempt %d/3): %s",
+                product_slug,
+                attempt,
+                exc,
+            )
+            time.sleep(1.0 * attempt)
 
     # Use resolved product_id or hint
     resolved_product_id = product_data.get("product_id") or product_id_hint
 
     # 2. Product About (media, makers, hunters, pricing)
-    try:
-        about_vars = {"productSlug": product_slug}
-        about_resp = client.execute_query(
-            operation_name="ProductAboutPage",
-            variables=about_vars,
-            sha256_hash=HASH_PRODUCT_ABOUT_PAGE,
-        )
-        media_items, people, about_info = parse_product_about(
-            about_resp,
-            product_id=resolved_product_id,
-            product_slug=product_slug,
-        )
-        if about_info:
-            product_data.update(about_info)
-    except Exception as exc:
-        logger.warning("Failed to fetch about page for product %s: %s", product_slug, exc)
+    for attempt in range(1, 4):
+        try:
+            about_vars = {"productSlug": product_slug}
+            about_resp = client.execute_query(
+                operation_name="ProductAboutPage",
+                variables=about_vars,
+                sha256_hash=HASH_PRODUCT_ABOUT_PAGE,
+            )
+            media_items, people, about_info = parse_product_about(
+                about_resp,
+                product_id=resolved_product_id,
+                product_slug=product_slug,
+            )
+            if about_info:
+                product_data.update(about_info)
+            break
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch about page for product %s (attempt %d/3): %s",
+                product_slug,
+                attempt,
+                exc,
+            )
+            time.sleep(1.0 * attempt)
 
     # 3. Product Built With
-    try:
-        bw_vars = {"slug": product_slug}
-        bw_resp = client.execute_query(
-            operation_name="ProductBuiltWithPage",
-            variables=bw_vars,
-            sha256_hash=HASH_PRODUCT_BUILT_WITH_PAGE,
-        )
-        built_with = parse_product_built_with(bw_resp, product_id=resolved_product_id)
-    except Exception as exc:
-        logger.warning("Failed to fetch built-with for product %s: %s", product_slug, exc)
+    for attempt in range(1, 4):
+        try:
+            bw_vars = {"slug": product_slug}
+            bw_resp = client.execute_query(
+                operation_name="ProductBuiltWithPage",
+                variables=bw_vars,
+                sha256_hash=HASH_PRODUCT_BUILT_WITH_PAGE,
+            )
+            built_with = parse_product_built_with(bw_resp, product_id=resolved_product_id)
+            break
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch built-with for product %s (attempt %d/3): %s",
+                product_slug,
+                attempt,
+                exc,
+            )
+            time.sleep(1.0 * attempt)
 
     return product_data, media_items, people, built_with
 
@@ -218,29 +243,44 @@ def fetch_product_comments(
         if cursor:
             variables["cursor"] = cursor
 
-        try:
-            resp = client.execute_query(
-                operation_name="ProductPageLaunchingTodayComments",
-                variables=variables,
-                sha256_hash=HASH_PRODUCT_COMMENTS,
-            )
-            comments, has_next, end_cursor, users = parse_comments_page(
-                resp, product_id=product_id, post_slug=post_slug
-            )
-            discovered_users.update(users)
+        success = False
+        for page_attempt in range(1, 4):
+            try:
+                resp = client.execute_query(
+                    operation_name="ProductPageLaunchingTodayComments",
+                    variables=variables,
+                    sha256_hash=HASH_PRODUCT_COMMENTS,
+                )
+                comments, has_next, end_cursor, users = parse_comments_page(
+                    resp, product_id=product_id, post_slug=post_slug
+                )
+                discovered_users.update(users)
 
-            for c in comments:
-                cid = c["comment_id"]
-                if cid not in seen_ids:
-                    seen_ids.add(cid)
-                    all_comments.append(c)
+                for c in comments:
+                    cid = c["comment_id"]
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        all_comments.append(c)
 
-            if not has_next or not end_cursor or end_cursor == cursor:
+                if not has_next or not end_cursor or end_cursor == cursor:
+                    logger.info("Retrieved %d unique comments for post_slug: %s", len(all_comments), post_slug)
+                    return all_comments, discovered_users
+                cursor = end_cursor
+                page += 1
+                success = True
                 break
-            cursor = end_cursor
-            page += 1
-        except Exception as exc:
-            logger.warning("Failed to fetch comments page %d for %s: %s", page, post_slug, exc)
+            except Exception as exc:
+                logger.warning(
+                    "Error fetching comments page %d for %s (attempt %d/3): %s",
+                    page,
+                    post_slug,
+                    page_attempt,
+                    exc,
+                )
+                time.sleep(1.5 * page_attempt)
+
+        if not success:
+            logger.error("Failed to fetch comments page %d for %s after 3 attempts. Stopping pagination.", page, post_slug)
             break
 
     logger.info("Retrieved %d unique comments for post_slug: %s", len(all_comments), post_slug)
@@ -258,24 +298,32 @@ def fetch_product_reviews(
     seen_ids: Set[str] = set()
     discovered_users: Set[str] = set()
 
-    # Step 1: Check review count gate
+    # Step 1: Check review count gate (with retries)
     review_count = 0
-    try:
-        count_resp = client.execute_query(
-            operation_name="DetailedReviewsPage",
-            variables={"slug": product_slug, "commentsListSubjectThreadsLimit": 10},
-            sha256_hash=HASH_DETAILED_REVIEWS_PAGE,
-        )
-        review_count = parse_detailed_reviews_count(count_resp)
-    except Exception as exc:
-        logger.warning("Failed to check review count for %s: %s", product_slug, exc)
+    for count_attempt in range(1, 4):
+        try:
+            count_resp = client.execute_query(
+                operation_name="DetailedReviewsPage",
+                variables={"slug": product_slug, "commentsListSubjectThreadsLimit": 10},
+                sha256_hash=HASH_DETAILED_REVIEWS_PAGE,
+            )
+            review_count = parse_detailed_reviews_count(count_resp)
+            break
+        except Exception as exc:
+            logger.warning(
+                "Failed to check review count for %s (attempt %d/3): %s",
+                product_slug,
+                count_attempt,
+                exc,
+            )
+            time.sleep(1.5 * count_attempt)
 
     logger.info("Detailed reviews count for %s: %d", product_slug, review_count)
     if review_count <= 0:
         logger.info("Skipping review feed for %s (count is 0)", product_slug)
         return [], discovered_users
 
-    # Step 2: Fetch review feed
+    # Step 2: Fetch review feed with pagination and retry per page
     cursor: Optional[str] = None
     page = 1
     while True:
@@ -287,29 +335,44 @@ def fetch_product_reviews(
         if cursor:
             variables["cursor"] = cursor
 
-        try:
-            feed_resp = client.execute_query(
-                operation_name="DetailedReviewsFeedQuery",
-                variables=variables,
-                sha256_hash=HASH_DETAILED_REVIEWS_FEED,
-            )
-            reviews, has_next, end_cursor, users = parse_detailed_reviews_feed(
-                feed_resp, product_id=product_id
-            )
-            discovered_users.update(users)
+        success = False
+        for feed_attempt in range(1, 4):
+            try:
+                feed_resp = client.execute_query(
+                    operation_name="DetailedReviewsFeedQuery",
+                    variables=variables,
+                    sha256_hash=HASH_DETAILED_REVIEWS_FEED,
+                )
+                reviews, has_next, end_cursor, users = parse_detailed_reviews_feed(
+                    feed_resp, product_id=product_id
+                )
+                discovered_users.update(users)
 
-            for r in reviews:
-                rid = r["review_id"]
-                if rid not in seen_ids:
-                    seen_ids.add(rid)
-                    all_reviews.append(r)
+                for r in reviews:
+                    rid = r["review_id"]
+                    if rid not in seen_ids:
+                        seen_ids.add(rid)
+                        all_reviews.append(r)
 
-            if not has_next or not end_cursor or end_cursor == cursor:
+                if not has_next or not end_cursor or end_cursor == cursor:
+                    logger.info("Retrieved %d unique reviews for product_slug: %s", len(all_reviews), product_slug)
+                    return all_reviews, discovered_users
+                cursor = end_cursor
+                page += 1
+                success = True
                 break
-            cursor = end_cursor
-            page += 1
-        except Exception as exc:
-            logger.warning("Failed to fetch review feed page %d for %s: %s", page, product_slug, exc)
+            except Exception as exc:
+                logger.warning(
+                    "Error fetching review feed page %d for %s (attempt %d/3): %s",
+                    page,
+                    product_slug,
+                    feed_attempt,
+                    exc,
+                )
+                time.sleep(1.5 * feed_attempt)
+
+        if not success:
+            logger.error("Failed to fetch reviews page %d for %s after 3 attempts. Stopping pagination.", page, product_slug)
             break
 
     logger.info("Retrieved %d unique reviews for product_slug: %s", len(all_reviews), product_slug)
@@ -326,12 +389,13 @@ def reset_browser_refresh_flag() -> None:
 
 
 def fetch_user_profile(
-    client: GraphQLClient, username: str, max_auth_retries: int = 1
+    client: GraphQLClient, username: str, max_auth_retries: int = 2
 ) -> Optional[Dict[str, Any]]:
     """Retrieve public profile data for a username by parsing SSR HTML.
 
     If 403 Forbidden is encountered, automatically launches visible Chrome
-    once to refresh cookies and User-Agent, then retries seamlessly.
+    to refresh cookies and User-Agent, then retries seamlessly.
+    Ensures baseline profile is preserved if SSR is gated.
     """
     global _browser_cookie_refresh_done
 
@@ -342,10 +406,22 @@ def fetch_user_profile(
     profile_url = f"https://www.producthunt.com/@{clean_username}"
     logger.info("Fetching user profile for @%s", clean_username)
 
+    html_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
     for attempt in range(max_auth_retries + 1):
         client._apply_delay()
         try:
-            resp = client.client.get(profile_url)
+            resp = client.client.get(profile_url, headers=html_headers)
+            client._last_request_time = time.time() if hasattr(time, "time") else 0.0
+
             if resp.status_code == 404:
                 logger.info("Profile not found (404) for @%s", clean_username)
                 return None
@@ -362,7 +438,6 @@ def fetch_user_profile(
                     clean_username,
                     wait,
                 )
-                import time
                 time.sleep(wait)
                 continue
 
@@ -387,10 +462,48 @@ def fetch_user_profile(
                         "Profile for @%s returned 403 Forbidden (Cloudflare protection).",
                         clean_username,
                     )
-                    return None
+                    # Return baseline profile so discovered user record is not dropped
+                    return {
+                        "username": clean_username.lower(),
+                        "user_id": "",
+                        "name": clean_username,
+                        "headline": "",
+                        "about": "",
+                        "is_maker": False,
+                        "is_verified": False,
+                        "verified": False,
+                        "streak": 0,
+                        "karma": 0,
+                        "twitter_username": "",
+                        "website_url": "",
+                        "avatar_url": "",
+                        "created_at": None,
+                        "social_links": {},
+                    }
 
             resp.raise_for_status()
-            return parse_profile_ssr(resp.text, username=clean_username)
+            parsed = parse_profile_ssr(resp.text, username=clean_username)
+            if parsed:
+                return parsed
+
+            # If 200 OK but page had no embedded Apollo data, return baseline
+            return {
+                "username": clean_username.lower(),
+                "user_id": "",
+                "name": clean_username,
+                "headline": "",
+                "about": "",
+                "is_maker": False,
+                "is_verified": False,
+                "verified": False,
+                "streak": 0,
+                "karma": 0,
+                "twitter_username": "",
+                "website_url": "",
+                "avatar_url": "",
+                "created_at": None,
+                "social_links": {},
+            }
 
         except Exception as exc:
             if "403" in str(exc) and not _browser_cookie_refresh_done and attempt < max_auth_retries:
@@ -410,7 +523,24 @@ def fetch_user_profile(
                 continue
 
             logger.warning("Failed to fetch profile for @%s: %s", clean_username, exc)
-            return None
+            if attempt >= max_auth_retries:
+                return {
+                    "username": clean_username.lower(),
+                    "user_id": "",
+                    "name": clean_username,
+                    "headline": "",
+                    "about": "",
+                    "is_maker": False,
+                    "is_verified": False,
+                    "verified": False,
+                    "streak": 0,
+                    "karma": 0,
+                    "twitter_username": "",
+                    "website_url": "",
+                    "avatar_url": "",
+                    "created_at": None,
+                    "social_links": {},
+                }
 
     return None
 

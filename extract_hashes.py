@@ -15,12 +15,15 @@ logger = get_logger("extract_hashes")
 
 
 def extract_hashes_and_cookies(
-    url: str = "https://www.producthunt.com/leaderboard/daily", timeout: int = 45
-) -> tuple[dict[str, str], str, str]:
+    url: str = "https://www.producthunt.com/leaderboard/daily",
+    timeout: int = 45,
+    return_html: bool = False,
+) -> tuple:
     """Launch visible browser, wait for user to interact, and capture GraphQL hashes.
 
     Returns:
-        tuple: (captured_hashes_dict, cookie_string, user_agent_string)
+        tuple: (captured_hashes_dict, cookie_string, user_agent_string) or
+               (captured_hashes_dict, cookie_string, user_agent_string, page_html) if return_html=True
     """
     print("\n=======================================================")
     print("      PRODUCT HUNT HASH & COOKIE EXTRACTION HELPER     ")
@@ -98,14 +101,27 @@ def extract_hashes_and_cookies(
                 except Exception:
                     continue
 
-            # Check if Leaderboard hash is found
-            if "LeaderboardDailyPage" in captured_hashes:
+            # Check if target page has completed loading / passed Cloudflare
+            if "leaderboard" not in url:
+                try:
+                    title = driver.title or ""
+                    if "Just a moment" not in title and "Attention Required" not in title and len(title) > 0:
+                        cks = driver.get_cookies()
+                        has_cf = any(c.get("name") == "cf_clearance" for c in cks)
+                        src = driver.page_source or ""
+                        if has_cf or "ApolloSSRDataTransport" in src or "profile" in src:
+                            print(f"\n[✓] Page loaded successfully: {title}")
+                            break
+                except Exception:
+                    pass
+            elif "LeaderboardDailyPage" in captured_hashes:
                 print("\n[✓] Successfully captured LeaderboardDailyPage hash!")
                 break
 
             time.sleep(1.0)
 
-        # 2. Extract cookies
+        # 2. Extract cookies and HTML
+        page_html = driver.page_source if driver else ""
         cookies = driver.get_cookies()
         if cookies:
             captured_cookies = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
@@ -148,6 +164,8 @@ def extract_hashes_and_cookies(
             print(f"[!] Could not update .env: {exc}")
 
     print("=======================================================\n")
+    if return_html:
+        return captured_hashes, captured_cookies, user_agent, page_html
     return captured_hashes, captured_cookies, user_agent
 
 

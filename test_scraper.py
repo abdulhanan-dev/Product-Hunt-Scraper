@@ -713,3 +713,70 @@ def test_rate_limit_429_exponential_backoff_and_retries(mocker):
     assert waits[2] == 4.0  # From Retry-After: 4 / backoff
     assert client.client.get.call_count == 4
 
+
+def test_fetch_product_comments_retries_page_error(mocker):
+    from scraper import fetch_product_comments
+
+    mock_client = MagicMock()
+    mock_sleep = mocker.patch("time.sleep")
+
+    # First call: page 1 returns 1 comment with hasNextPage=True
+    resp_page1 = {
+        "data": {
+            "post": {
+                "threads": {
+                    "pageInfo": {"hasNextPage": True, "endCursor": "cur1"},
+                    "edges": [
+                        {
+                            "node": {
+                                "id": "c1",
+                                "body": "Great product!",
+                                "createdAt": "2026-11-04T12:00:00Z",
+                                "user": {"id": "u1", "username": "user1"},
+                            }
+                        }
+                    ],
+                }
+            }
+        }
+    }
+
+    # Second call (page 2 attempt 1): raises transient exception
+    # Third call (page 2 attempt 2): succeeds with 1 comment
+    resp_page2 = {
+        "data": {
+            "post": {
+                "threads": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "edges": [
+                        {
+                            "node": {
+                                "id": "c2",
+                                "body": "Awesome launch!",
+                                "createdAt": "2026-11-04T13:00:00Z",
+                                "user": {"id": "u2", "username": "user2"},
+                            }
+                        }
+                    ],
+                }
+            }
+        }
+    }
+
+    mock_client.execute_query.side_effect = [
+        resp_page1,
+        RuntimeError("Transient network failure"),
+        resp_page2,
+    ]
+
+    comments, users = fetch_product_comments(mock_client, post_slug="test-product", product_id="p1")
+
+    assert len(comments) == 2
+    assert comments[0]["comment_id"] == "c1"
+    assert comments[1]["comment_id"] == "c2"
+    assert "user1" in users
+    assert "user2" in users
+    # Verify execute_query was called 3 times (1 for page 1, 2 for page 2)
+    assert mock_client.execute_query.call_count == 3
+
+

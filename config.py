@@ -52,7 +52,7 @@ class Settings(BaseSettings):
         validation_alias="MAX_RETRIES",
     )
     request_delay_seconds: float = Field(
-        default=1.0,
+        default=1.2,
         validation_alias="REQUEST_DELAY_SECONDS",
     )
     log_level: str = Field(

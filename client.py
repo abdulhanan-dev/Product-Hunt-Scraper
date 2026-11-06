@@ -174,14 +174,32 @@ class GraphQLClient:
                     )
                     raise
                 logger.warning(
-                    "HTTP error (%s) on %s attempt %d. Retrying in %.1fs...",
+                    "HTTP error (%s) on %s (attempt %d/%d). Retrying in %.1fs...",
                     exc.__class__.__name__,
                     operation_name,
                     attempt,
+                    self.max_retries,
                     backoff,
                 )
                 time.sleep(backoff)
-                backoff *= 2
+                backoff = min(backoff * 2, 60.0)
+            except Exception as exc:
+                # If it's an explicit GraphQL error that was raised, bubble it up
+                if "GraphQL returned errors" in str(exc) or "Access forbidden" in str(exc):
+                    raise
+                if attempt > self.max_retries:
+                    logger.error("Exceeded max retries for %s: %s", operation_name, exc)
+                    raise
+                logger.warning(
+                    "Transient error (%s) on %s (attempt %d/%d). Retrying in %.1fs...",
+                    exc,
+                    operation_name,
+                    attempt,
+                    self.max_retries,
+                    backoff,
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
 
         raise RuntimeError(f"Failed to execute {operation_name} after {self.max_retries} retries")
 

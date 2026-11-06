@@ -99,6 +99,9 @@ def run_pipeline(
             if not product_slug:
                 continue
 
+            # Enforce request delay between products
+            client._apply_delay()
+
             # Strict Deduplication Check: Skip if product already present in DB
             existing_product = None
             if product_id:
@@ -127,45 +130,54 @@ def run_pipeline(
                 product_id,
             )
 
-            # 3.1 Product Details, About & Built-With
-            product_data, media_items, people, built_with = enrich_product(
-                client=client,
-                product_slug=product_slug,
-                product_id_hint=product_id,
-            )
-
-            if product_data:
-                upsert_product(db, product_data)
-                enriched_products_count += 1
-
-            if media_items:
-                total_media_count += upsert_product_media(db, media_items)
-
-            if people:
-                total_people_count += upsert_product_people(db, people)
-                for p in people:
-                    if p.get("username"):
-                        new_discovered_usernames.add(p["username"])
-
-            if built_with:
-                total_bw_count += upsert_product_built_with(db, built_with)
-
-            # 3.2 Comments (CRITICAL: uses post_slug!)
-            if post_slug:
-                comments, comment_users = fetch_product_comments(
-                    client=client, post_slug=post_slug, product_id=product_id
+            try:
+                # 3.1 Product Details, About & Built-With
+                product_data, media_items, people, built_with = enrich_product(
+                    client=client,
+                    product_slug=product_slug,
+                    product_id_hint=product_id,
                 )
-                if comments:
-                    total_comments_count += upsert_comments(db, comments)
-                new_discovered_usernames.update(comment_users)
 
-            # 3.3 Detailed Reviews (gated by count)
-            reviews, review_users = fetch_product_reviews(
-                client=client, product_slug=product_slug, product_id=product_id
-            )
-            if reviews:
-                total_reviews_count += upsert_reviews(db, reviews)
-            new_discovered_usernames.update(review_users)
+                if product_data:
+                    upsert_product(db, product_data)
+                    enriched_products_count += 1
+
+                if media_items:
+                    total_media_count += upsert_product_media(db, media_items)
+
+                if people:
+                    total_people_count += upsert_product_people(db, people)
+                    for p in people:
+                        if p.get("username"):
+                            new_discovered_usernames.add(p["username"])
+
+                if built_with:
+                    total_bw_count += upsert_product_built_with(db, built_with)
+
+                # 3.2 Comments (CRITICAL: uses post_slug!)
+                if post_slug:
+                    comments, comment_users = fetch_product_comments(
+                        client=client, post_slug=post_slug, product_id=product_id
+                    )
+                    if comments:
+                        total_comments_count += upsert_comments(db, comments)
+                    new_discovered_usernames.update(comment_users)
+
+                # 3.3 Detailed Reviews (gated by count)
+                reviews, review_users = fetch_product_reviews(
+                    client=client, product_slug=product_slug, product_id=product_id
+                )
+                if reviews:
+                    total_reviews_count += upsert_reviews(db, reviews)
+                new_discovered_usernames.update(review_users)
+
+            except Exception as exc:
+                logger.error(
+                    "Error enriching product '%s' (%s): %s. Moving to next product.",
+                    product_slug,
+                    product_id,
+                    exc,
+                )
 
         # 4. Stage 3: Public Profile Extraction for newly discovered users
         logger.info(
@@ -194,10 +206,14 @@ def run_pipeline(
                 len(new_discovered_usernames),
                 clean_u,
             )
-            profile = fetch_user_profile(client=client, username=clean_u)
-            if profile:
-                upsert_profile(db, profile)
-                total_profiles_count += 1
+            client._apply_delay()
+            try:
+                profile = fetch_user_profile(client=client, username=clean_u)
+                if profile:
+                    upsert_profile(db, profile)
+                    total_profiles_count += 1
+            except Exception as exc:
+                logger.warning("Error fetching profile @%s: %s", clean_u, exc)
 
         elapsed = round(time.time() - start_time, 2)
 
