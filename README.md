@@ -94,6 +94,12 @@ LOG_LEVEL=INFO
 
 ## Usage
 
+### Auto-Extract Hashes & Cookies (Interactive Chrome)
+Launches a visible Chrome window where you solve any Cloudflare prompt directly, and automatically updates `.env` with the captured `LeaderboardDailyPage` hash and cookies:
+```bash
+.venv/bin/python extract_hashes.py
+```
+
 ### Run Daily Scraper (Scheduled / Manual)
 Pulls featured launches for yesterday in Pacific Time:
 ```bash
@@ -132,3 +138,4 @@ Run the full pytest test suite:
 .venv/bin/pytest test_scraper.py
 ```
 All unit tests run offline using mock fixtures and verify date calculations, parsers, pagination, and database upserts.
+
