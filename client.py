@@ -104,6 +104,25 @@ class GraphQLClient:
                     backoff *= 2
                     continue
 
+                # Handle 403 Forbidden (Cloudflare session refresh)
+                if response.status_code == 403:
+                    logger.warning(
+                        "Received 403 Forbidden on %s. Launching browser to refresh session...",
+                        operation_name,
+                    )
+                    try:
+                        from extract_hashes import extract_hashes_and_cookies
+                        extracted, cookies = extract_hashes_and_cookies()
+                        if cookies:
+                            self.client.headers["Cookie"] = cookies
+                        if operation_name in extracted:
+                            new_hash = extracted[operation_name]
+                            extensions = {"persistedQuery": {"version": 1, "sha256Hash": new_hash}}
+                            params["extensions"] = json.dumps(extensions)
+                        continue
+                    except Exception as exc:
+                        logger.error("Failed to auto-refresh session: %s", exc)
+
                 # Handle Server Errors (5xx)
                 if 500 <= response.status_code < 600:
                     logger.warning(

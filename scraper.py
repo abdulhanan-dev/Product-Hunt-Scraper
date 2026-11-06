@@ -312,8 +312,14 @@ def fetch_product_reviews(
     return all_reviews, discovered_users
 
 
-def fetch_user_profile(client: GraphQLClient, username: str) -> Optional[Dict[str, Any]]:
-    """Retrieve public profile data for a username by parsing SSR HTML."""
+def fetch_user_profile(
+    client: GraphQLClient, username: str, max_auth_retries: int = 1
+) -> Optional[Dict[str, Any]]:
+    """Retrieve public profile data for a username by parsing SSR HTML.
+
+    If 403 Forbidden is encountered, automatically launches visible Chrome
+    to refresh cookies, updates client headers, and retries seamlessly.
+    """
     clean_username = username.strip().lstrip("@")
     if not clean_username:
         return None
@@ -321,15 +327,53 @@ def fetch_user_profile(client: GraphQLClient, username: str) -> Optional[Dict[st
     profile_url = f"https://www.producthunt.com/@{clean_username}"
     logger.info("Fetching user profile for @%s", clean_username)
 
-    client._apply_delay()
-    try:
-        resp = client.client.get(profile_url)
-        if resp.status_code == 404:
-            logger.info("Profile not found (404) for @%s", clean_username)
+    for attempt in range(max_auth_retries + 1):
+        client._apply_delay()
+        try:
+            resp = client.client.get(profile_url)
+            if resp.status_code == 404:
+                logger.info("Profile not found (404) for @%s", clean_username)
+                return None
+
+            if resp.status_code == 403:
+                if attempt < max_auth_retries:
+                    logger.warning(
+                        "Received 403 Forbidden for @%s. Launching browser to refresh cookies...",
+                        clean_username,
+                    )
+                    from extract_hashes import extract_hashes_and_cookies
+
+                    extracted, cookies = extract_hashes_and_cookies(url=profile_url)
+                    if cookies:
+                        client.client.headers["Cookie"] = cookies
+                    logger.info("Retrying profile fetch for @%s with fresh cookies...", clean_username)
+                    continue
+                else:
+                    logger.warning(
+                        "Profile for @%s remained 403 Forbidden after refreshing cookies.",
+                        clean_username,
+                    )
+                    return None
+
+            resp.raise_for_status()
+            return parse_profile_ssr(resp.text, username=clean_username)
+
+        except Exception as exc:
+            if "403" in str(exc) and attempt < max_auth_retries:
+                logger.warning(
+                    "403 error for @%s (%s). Launching browser to refresh cookies...",
+                    clean_username,
+                    exc,
+                )
+                from extract_hashes import extract_hashes_and_cookies
+
+                extracted, cookies = extract_hashes_and_cookies(url=profile_url)
+                if cookies:
+                    client.client.headers["Cookie"] = cookies
+                continue
+
+            logger.warning("Failed to fetch profile for @%s: %s", clean_username, exc)
             return None
-        resp.raise_for_status()
-        return parse_profile_ssr(resp.text, username=clean_username)
-    except Exception as exc:
-        logger.warning("Failed to fetch profile for @%s: %s", clean_username, exc)
-        return None
+
+    return None
 

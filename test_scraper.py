@@ -612,3 +612,46 @@ def test_auto_hash_extraction_on_expired_hash(mocker):
     # Second call should have used the fresh hash
     assert mock_client.execute_query.call_args_list[1][1]["sha256_hash"] == "fresh_new_hash_123"
 
+
+def test_fetch_user_profile_recovers_from_403(mocker):
+    from scraper import fetch_user_profile
+
+    mock_client = MagicMock()
+    mock_client.client.headers = {}
+
+    # First GET response: 403 Forbidden
+    # Second GET response: 200 OK with Apollo HTML
+    mock_resp_403 = MagicMock()
+    mock_resp_403.status_code = 403
+
+    mock_resp_200 = MagicMock()
+    mock_resp_200.status_code = 200
+    mock_resp_200.text = """
+    <script>
+    window.__APOLLO_STATE__ = {
+      "data": {
+        "profile": {
+          "id": "u_test",
+          "name": "Test User",
+          "headline": "Builder"
+        }
+      }
+    };
+    </script>
+    """
+
+    mock_client.client.get.side_effect = [mock_resp_403, mock_resp_200]
+
+    mock_extractor = mocker.patch("extract_hashes.extract_hashes_and_cookies")
+    mock_extractor.return_value = ({}, "fresh_session_cookie=abc")
+
+    profile = fetch_user_profile(mock_client, username="testuser")
+
+    assert profile is not None
+    assert profile["username"] == "testuser"
+    assert profile["name"] == "Test User"
+    assert mock_extractor.call_count == 1
+    # Check that fresh cookies were injected into client headers
+    assert mock_client.client.headers["Cookie"] == "fresh_session_cookie=abc"
+    assert mock_client.client.get.call_count == 2
+
