@@ -74,6 +74,26 @@ def ensure_indexes(db: Database) -> None:
     logger.info("Indexes successfully ensured.")
 
 
+def flush_database(db: Database) -> None:
+    """Clear all documents from all scraper collections while preserving indexes."""
+    logger.info("Flushing all data from database: %s", db.name)
+    collections = [
+        "launches",
+        "products",
+        "product_media",
+        "product_people",
+        "product_built_with",
+        "comments",
+        "reviews",
+        "profiles",
+        "scraper_runs",
+    ]
+    for col in collections:
+        deleted = db[col].delete_many({}).deleted_count
+        logger.info("Cleared %d documents from collection '%s'", deleted, col)
+    logger.info("Database successfully flushed.")
+
+
 def upsert_launch(db: Database, launch: Dict[str, Any]) -> None:
     """Idempotently insert or update a daily launch record."""
     launch["updated_at"] = datetime.now(timezone.utc).isoformat()

@@ -9,6 +9,7 @@ from client import GraphQLClient
 from config import settings
 from database import (
     ensure_indexes,
+    flush_database,
     get_db,
     record_run_finish,
     record_run_start,
@@ -29,26 +30,41 @@ from scraper import (
     fetch_product_comments,
     fetch_product_reviews,
     fetch_user_profile,
+    reset_browser_refresh_flag,
 )
 from utils import get_logger, get_pacific_yesterday
 
 logger = get_logger("main", settings.log_level)
 
 
-def run_pipeline(target_date: str, resume: bool = False, limit: Optional[int] = None) -> None:
-    """Execute the full 3-stage Product Hunt scraper pipeline."""
+def run_pipeline(
+    target_date: str,
+    force: bool = False,
+    limit: Optional[int] = None,
+    flush: bool = False,
+) -> None:
+    """Execute the Product Hunt scraper pipeline with automatic deduplication."""
     run_id = f"run_{target_date}_{uuid4().hex[:8]}"
     start_time = time.time()
 
     logger.info("==================================================")
     logger.info("Product Hunt Scraper starting (run_id: %s)", run_id)
-    logger.info("Target Pacific date: %s (resume=%s, limit=%s)", target_date, resume, limit)
+    logger.info(
+        "Target Pacific date: %s (force=%s, limit=%s, flush=%s)",
+        target_date,
+        force,
+        limit,
+        flush,
+    )
     logger.info("==================================================")
+    reset_browser_refresh_flag()
 
     # 1. Connect to Database & initialize indexes
     try:
         db = get_db()
         ensure_indexes(db)
+        if flush:
+            flush_database(db)
         record_run_start(db, run_id=run_id, target_date=target_date)
     except Exception as exc:
         logger.error("Failed to connect or initialize MongoDB: %s", exc)
@@ -57,33 +73,24 @@ def run_pipeline(target_date: str, resume: bool = False, limit: Optional[int] = 
     client = GraphQLClient()
     try:
         # 2. Stage 1: Leaderboard
-        launches = []
-        if resume:
-            existing_cursor = db.launches.find({"target_date": target_date})
-            launches = list(existing_cursor)
-            if launches:
-                logger.info("Resuming: Found %d existing launches in database.", len(launches))
-
-        if not launches:
-            launches = fetch_daily_leaderboard(client=client, target_date=target_date)
-            saved_count = upsert_launches(db, launches)
-            logger.info("Stage 1 complete: %d launches saved.", saved_count)
-        else:
-            saved_count = len(launches)
+        launches = fetch_daily_leaderboard(client=client, target_date=target_date)
+        saved_count = upsert_launches(db, launches)
+        logger.info("Stage 1 complete: %d launches saved/updated.", saved_count)
 
         if limit and limit > 0:
-            logger.info("Applying test limit: processing first %d of %d launches", limit, len(launches))
+            logger.info("Applying limit: processing first %d of %d launches", limit, len(launches))
             launches = launches[:limit]
 
-        # 3. Stage 2: Product Enrichment
-        logger.info("Starting Stage 2: Enriching %d products...", len(launches))
+        # 3. Stage 2: Product Enrichment (With Strict Deduplication)
+        logger.info("Starting Stage 2: Checking %d products for new entries...", len(launches))
         enriched_products_count = 0
+        skipped_products_count = 0
         total_media_count = 0
         total_people_count = 0
         total_bw_count = 0
         total_comments_count = 0
         total_reviews_count = 0
-        discovered_usernames: set[str] = set()
+        new_discovered_usernames: set[str] = set()
 
         for idx, launch in enumerate(launches, 1):
             product_slug = launch.get("product_slug") or launch.get("post_slug")
@@ -92,14 +99,27 @@ def run_pipeline(target_date: str, resume: bool = False, limit: Optional[int] = 
             if not product_slug:
                 continue
 
-            # Resumability check: if resume=True and product already enriched, skip
-            if resume and product_id:
-                if db.products.find_one({"product_id": product_id}):
-                    logger.info("[%d/%d] Skipping already enriched product: %s", idx, len(launches), product_slug)
-                    continue
+            # Strict Deduplication Check: Skip if product already present in DB
+            existing_product = None
+            if product_id:
+                existing_product = db.products.find_one({"product_id": str(product_id)})
+            if not existing_product and product_slug:
+                existing_product = db.products.find_one({"slug": product_slug})
 
+            if existing_product and not force:
+                logger.info(
+                    "[%d/%d] Product '%s' (id: %s) ALREADY IN DATABASE. Skipping Stage 2 & 3.",
+                    idx,
+                    len(launches),
+                    product_slug,
+                    product_id,
+                )
+                skipped_products_count += 1
+                continue
+
+            # NEW PRODUCT: Run all 3 stages for it!
             logger.info(
-                "[%d/%d] Enriching product: %s (post: %s, id: %s)",
+                "[%d/%d] NEW PRODUCT '%s' (post: %s, id: %s) -> Running enrichment...",
                 idx,
                 len(launches),
                 product_slug,
@@ -125,7 +145,7 @@ def run_pipeline(target_date: str, resume: bool = False, limit: Optional[int] = 
                 total_people_count += upsert_product_people(db, people)
                 for p in people:
                     if p.get("username"):
-                        discovered_usernames.add(p["username"])
+                        new_discovered_usernames.add(p["username"])
 
             if built_with:
                 total_bw_count += upsert_product_built_with(db, built_with)
@@ -137,7 +157,7 @@ def run_pipeline(target_date: str, resume: bool = False, limit: Optional[int] = 
                 )
                 if comments:
                     total_comments_count += upsert_comments(db, comments)
-                discovered_usernames.update(comment_users)
+                new_discovered_usernames.update(comment_users)
 
             # 3.3 Detailed Reviews (gated by count)
             reviews, review_users = fetch_product_reviews(
@@ -145,21 +165,36 @@ def run_pipeline(target_date: str, resume: bool = False, limit: Optional[int] = 
             )
             if reviews:
                 total_reviews_count += upsert_reviews(db, reviews)
-            discovered_usernames.update(review_users)
+            new_discovered_usernames.update(review_users)
 
-        # 4. Stage 3: Public Profile Extraction
+        # 4. Stage 3: Public Profile Extraction for newly discovered users
         logger.info(
-            "Starting Stage 3: Fetching profiles for %d discovered usernames...",
-            len(discovered_usernames),
+            "Starting Stage 3: Fetching profiles for %d newly discovered usernames...",
+            len(new_discovered_usernames),
         )
         total_profiles_count = 0
-        for u_idx, username in enumerate(discovered_usernames, 1):
-            if resume and db.profiles.find_one({"username": username.lower()}):
-                logger.info("[%d/%d] Skipping already saved profile: @%s", u_idx, len(discovered_usernames), username)
+        skipped_profiles_count = 0
+
+        for u_idx, username in enumerate(new_discovered_usernames, 1):
+            clean_u = username.lower().strip().lstrip("@")
+            # Profile dedup: skip if already in DB
+            if not force and db.profiles.find_one({"username": clean_u}):
+                logger.info(
+                    "[%d/%d] Profile @%s already in database. Skipping.",
+                    u_idx,
+                    len(new_discovered_usernames),
+                    clean_u,
+                )
+                skipped_profiles_count += 1
                 continue
 
-            logger.info("[%d/%d] Fetching profile: @%s", u_idx, len(discovered_usernames), username)
-            profile = fetch_user_profile(client=client, username=username)
+            logger.info(
+                "[%d/%d] Fetching new profile: @%s",
+                u_idx,
+                len(new_discovered_usernames),
+                clean_u,
+            )
+            profile = fetch_user_profile(client=client, username=clean_u)
             if profile:
                 upsert_profile(db, profile)
                 total_profiles_count += 1
@@ -169,27 +204,27 @@ def run_pipeline(target_date: str, resume: bool = False, limit: Optional[int] = 
         stats = {
             "total_launches_found": len(launches),
             "launches_upserted": saved_count,
-            "products_enriched": enriched_products_count,
+            "new_products_enriched": enriched_products_count,
+            "existing_products_skipped": skipped_products_count,
             "media_items_saved": total_media_count,
             "people_relationships_saved": total_people_count,
             "built_with_saved": total_bw_count,
             "comments_saved": total_comments_count,
             "reviews_saved": total_reviews_count,
-            "profiles_saved": total_profiles_count,
+            "new_profiles_saved": total_profiles_count,
+            "existing_profiles_skipped": skipped_profiles_count,
             "duration_seconds": elapsed,
         }
         record_run_finish(db, run_id=run_id, status="SUCCESS", stats=stats)
 
         logger.info("==================================================")
         logger.info(
-            "Run %s completed in %.2fs: %d launches, %d products, %d comments, %d reviews, %d profiles saved.",
+            "Run %s completed in %.2fs: %d launches, %d new products enriched, %d skipped (already in DB).",
             run_id,
             elapsed,
             saved_count,
             enriched_products_count,
-            total_comments_count,
-            total_reviews_count,
-            total_profiles_count,
+            skipped_products_count,
         )
         logger.info("==================================================")
 
@@ -212,20 +247,30 @@ def main() -> None:
         help="Target date in YYYY-MM-DD format (defaults to yesterday in America/Los_Angeles)",
     )
     parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume an interrupted run (skips already enriched records in MongoDB)",
-    )
-    parser.add_argument(
         "--limit",
         type=int,
         default=None,
         help="Optional limit on number of products to enrich (useful for test runs)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-enrichment of products even if already in database",
+    )
+    parser.add_argument(
+        "--flush",
+        action="store_true",
+        help="Flush/clear all database collections before running",
+    )
     args = parser.parse_args()
 
     target_date = args.date or get_pacific_yesterday()
-    run_pipeline(target_date=target_date, resume=args.resume, limit=args.limit)
+    run_pipeline(
+        target_date=target_date,
+        force=args.force,
+        limit=args.limit,
+        flush=args.flush,
+    )
 
 
 if __name__ == "__main__":

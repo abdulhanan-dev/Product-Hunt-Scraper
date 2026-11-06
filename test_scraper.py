@@ -600,7 +600,7 @@ def test_auto_hash_extraction_on_expired_hash(mocker):
     ]
 
     mock_extractor = mocker.patch("extract_hashes.extract_hashes_and_cookies")
-    mock_extractor.return_value = ({"LeaderboardDailyPage": "fresh_new_hash_123"}, "dummy_cookie")
+    mock_extractor.return_value = ({"LeaderboardDailyPage": "fresh_new_hash_123"}, "dummy_cookie", "dummy_ua")
 
     launches = fetch_daily_leaderboard(
         mock_client, target_date="2026-11-04", operation_hash="expired_hash"
@@ -643,7 +643,7 @@ def test_fetch_user_profile_recovers_from_403(mocker):
     mock_client.client.get.side_effect = [mock_resp_403, mock_resp_200]
 
     mock_extractor = mocker.patch("extract_hashes.extract_hashes_and_cookies")
-    mock_extractor.return_value = ({}, "fresh_session_cookie=abc")
+    mock_extractor.return_value = ({}, "fresh_session_cookie=abc", "Mozilla/5.0 DummyUA")
 
     profile = fetch_user_profile(mock_client, username="testuser")
 
@@ -653,5 +653,33 @@ def test_fetch_user_profile_recovers_from_403(mocker):
     assert mock_extractor.call_count == 1
     # Check that fresh cookies were injected into client headers
     assert mock_client.client.headers["Cookie"] == "fresh_session_cookie=abc"
+    assert mock_client.client.headers["User-Agent"] == "Mozilla/5.0 DummyUA"
     assert mock_client.client.get.call_count == 2
+
+
+def test_product_deduplication_skips_existing(mocker):
+    from main import run_pipeline
+
+    mock_db = MagicMock()
+    # Simulate that product already exists in MongoDB
+    mock_db.products.find_one.return_value = {"product_id": "1001", "name": "Existing App"}
+
+    mocker.patch("main.get_db", return_value=mock_db)
+    mocker.patch("main.ensure_indexes")
+    mocker.patch("main.record_run_start")
+    mocker.patch("main.record_run_finish")
+    mocker.patch("main.upsert_launches", return_value=1)
+
+    mock_enrich = mocker.patch("main.enrich_product")
+
+    # Mock leaderboard with 1 product
+    mocker.patch(
+        "main.fetch_daily_leaderboard",
+        return_value=[{"post_id": "p_1", "product_id": "1001", "product_slug": "existing-app"}],
+    )
+
+    run_pipeline(target_date="2026-11-04", force=False)
+
+    # Because product already exists, enrich_product should NOT be called!
+    assert mock_enrich.call_count == 0
 

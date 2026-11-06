@@ -15,12 +15,12 @@ logger = get_logger("extract_hashes")
 
 
 def extract_hashes_and_cookies(
-    url: str = "https://www.producthunt.com/leaderboard/daily", timeout: int = 60
-) -> tuple[dict[str, str], str]:
+    url: str = "https://www.producthunt.com/leaderboard/daily", timeout: int = 45
+) -> tuple[dict[str, str], str, str]:
     """Launch visible browser, wait for user to interact, and capture GraphQL hashes.
 
     Returns:
-        tuple: (captured_hashes_dict, cookie_string)
+        tuple: (captured_hashes_dict, cookie_string, user_agent_string)
     """
     print("\n=======================================================")
     print("      PRODUCT HUNT HASH & COOKIE EXTRACTION HELPER     ")
@@ -38,10 +38,16 @@ def extract_hashes_and_cookies(
     driver = None
     captured_hashes = {}
     captured_cookies = ""
+    user_agent = ""
 
     try:
         driver = webdriver.Chrome(options=chrome_options)
         driver.get(url)
+
+        try:
+            user_agent = driver.execute_script("return navigator.userAgent")
+        except Exception:
+            pass
 
         start_time = time.time()
         print(f"Monitoring network traffic for up to {timeout} seconds...")
@@ -142,7 +148,7 @@ def extract_hashes_and_cookies(
             print(f"[!] Could not update .env: {exc}")
 
     print("=======================================================\n")
-    return captured_hashes, captured_cookies
+    return captured_hashes, captured_cookies, user_agent
 
 
 def update_env_file(leaderboard_hash: str = None, cookie_str: str = None) -> None:

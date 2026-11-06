@@ -44,10 +44,12 @@ def fetch_daily_leaderboard(
         logger.warning("No Leaderboard hash configured. Automatically launching hash extractor...")
         try:
             from extract_hashes import extract_hashes_and_cookies
-            extracted, cookies = extract_hashes_and_cookies()
+            extracted, cookies, ua = extract_hashes_and_cookies()
             hash_to_use = extracted.get("LeaderboardDailyPage")
             if cookies:
                 client.client.headers["Cookie"] = cookies
+            if ua:
+                client.client.headers["User-Agent"] = ua
         except Exception as exc:
             logger.error("Auto extraction failed: %s", exc)
 
@@ -87,12 +89,14 @@ def fetch_daily_leaderboard(
                     err_msg,
                 )
                 from extract_hashes import extract_hashes_and_cookies
-                extracted, cookies = extract_hashes_and_cookies()
+                extracted, cookies, ua = extract_hashes_and_cookies()
                 new_hash = extracted.get("LeaderboardDailyPage")
                 if new_hash:
                     hash_to_use = new_hash
                 if cookies:
                     client.client.headers["Cookie"] = cookies
+                if ua:
+                    client.client.headers["User-Agent"] = ua
 
                 # Retry query with fresh hash
                 response = client.execute_query(
@@ -312,14 +316,25 @@ def fetch_product_reviews(
     return all_reviews, discovered_users
 
 
+_browser_cookie_refresh_done = False
+
+
+def reset_browser_refresh_flag() -> None:
+    """Reset the browser cookie refresh flag for a new run."""
+    global _browser_cookie_refresh_done
+    _browser_cookie_refresh_done = False
+
+
 def fetch_user_profile(
     client: GraphQLClient, username: str, max_auth_retries: int = 1
 ) -> Optional[Dict[str, Any]]:
     """Retrieve public profile data for a username by parsing SSR HTML.
 
     If 403 Forbidden is encountered, automatically launches visible Chrome
-    to refresh cookies, updates client headers, and retries seamlessly.
+    once to refresh cookies and User-Agent, then retries seamlessly.
     """
+    global _browser_cookie_refresh_done
+
     clean_username = username.strip().lstrip("@")
     if not clean_username:
         return None
@@ -336,21 +351,24 @@ def fetch_user_profile(
                 return None
 
             if resp.status_code == 403:
-                if attempt < max_auth_retries:
+                if not _browser_cookie_refresh_done and attempt < max_auth_retries:
+                    _browser_cookie_refresh_done = True
                     logger.warning(
                         "Received 403 Forbidden for @%s. Launching browser to refresh cookies...",
                         clean_username,
                     )
                     from extract_hashes import extract_hashes_and_cookies
 
-                    extracted, cookies = extract_hashes_and_cookies(url=profile_url)
+                    extracted, cookies, ua = extract_hashes_and_cookies(url=profile_url)
                     if cookies:
                         client.client.headers["Cookie"] = cookies
-                    logger.info("Retrying profile fetch for @%s with fresh cookies...", clean_username)
+                    if ua:
+                        client.client.headers["User-Agent"] = ua
+                    logger.info("Retrying profile fetch for @%s with fresh session...", clean_username)
                     continue
                 else:
                     logger.warning(
-                        "Profile for @%s remained 403 Forbidden after refreshing cookies.",
+                        "Profile for @%s returned 403 Forbidden (Cloudflare protection).",
                         clean_username,
                     )
                     return None
@@ -359,7 +377,8 @@ def fetch_user_profile(
             return parse_profile_ssr(resp.text, username=clean_username)
 
         except Exception as exc:
-            if "403" in str(exc) and attempt < max_auth_retries:
+            if "403" in str(exc) and not _browser_cookie_refresh_done and attempt < max_auth_retries:
+                _browser_cookie_refresh_done = True
                 logger.warning(
                     "403 error for @%s (%s). Launching browser to refresh cookies...",
                     clean_username,
@@ -367,9 +386,11 @@ def fetch_user_profile(
                 )
                 from extract_hashes import extract_hashes_and_cookies
 
-                extracted, cookies = extract_hashes_and_cookies(url=profile_url)
+                extracted, cookies, ua = extract_hashes_and_cookies(url=profile_url)
                 if cookies:
                     client.client.headers["Cookie"] = cookies
+                if ua:
+                    client.client.headers["User-Agent"] = ua
                 continue
 
             logger.warning("Failed to fetch profile for @%s: %s", clean_username, exc)
