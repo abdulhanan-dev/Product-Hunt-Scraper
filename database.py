@@ -47,6 +47,27 @@ def ensure_indexes(db: Database) -> None:
     # profiles: unique on username
     db.profiles.create_index([("username", ASCENDING)], unique=True, name="idx_profiles_username")
 
+    # product_media: compound unique on product_id + media_url
+    db.product_media.create_index(
+        [("product_id", ASCENDING), ("media_url", ASCENDING)],
+        unique=True,
+        name="idx_product_media_product_id_media_url",
+    )
+
+    # product_people: compound unique on product_id + username + role
+    db.product_people.create_index(
+        [("product_id", ASCENDING), ("username", ASCENDING), ("role", ASCENDING)],
+        unique=True,
+        name="idx_product_people_product_id_username_role",
+    )
+
+    # product_built_with: compound unique on product_id + related_product_id
+    db.product_built_with.create_index(
+        [("product_id", ASCENDING), ("related_product_id", ASCENDING)],
+        unique=True,
+        name="idx_product_built_with_product_related",
+    )
+
     # scraper_runs: unique on run_id
     db.scraper_runs.create_index([("run_id", ASCENDING)], unique=True, name="idx_scraper_runs_run_id")
 
@@ -71,6 +92,77 @@ def upsert_launches(db: Database, launches: List[Dict[str, Any]]) -> int:
     count = 0
     for item in launches:
         upsert_launch(db, item)
+        count += 1
+    return count
+
+
+def upsert_product(db: Database, product: Dict[str, Any]) -> None:
+    """Idempotently insert or update a product document."""
+    product_id = str(product.get("product_id", ""))
+    if not product_id:
+        return
+    product["updated_at"] = datetime.now(timezone.utc).isoformat()
+    db.products.update_one(
+        {"product_id": product_id},
+        {"$set": product},
+        upsert=True,
+    )
+
+
+def upsert_product_media(db: Database, media_items: List[Dict[str, Any]]) -> int:
+    """Upsert media items for a product."""
+    count = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for item in media_items:
+        product_id = str(item.get("product_id", ""))
+        media_url = item.get("media_url", "")
+        if not product_id or not media_url:
+            continue
+        item["updated_at"] = now
+        db.product_media.update_one(
+            {"product_id": product_id, "media_url": media_url},
+            {"$set": item},
+            upsert=True,
+        )
+        count += 1
+    return count
+
+
+def upsert_product_people(db: Database, people: List[Dict[str, Any]]) -> int:
+    """Upsert maker and hunter relationships for a product."""
+    count = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for person in people:
+        product_id = str(person.get("product_id", ""))
+        username = person.get("username", "")
+        role = person.get("role", "")
+        if not product_id or not username or not role:
+            continue
+        person["updated_at"] = now
+        db.product_people.update_one(
+            {"product_id": product_id, "username": username, "role": role},
+            {"$set": person},
+            upsert=True,
+        )
+        count += 1
+    return count
+
+
+def upsert_product_built_with(db: Database, items: List[Dict[str, Any]]) -> int:
+    """Upsert built-with and shoutout relationships for a product."""
+    count = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for item in items:
+        product_id = str(item.get("product_id", ""))
+        related_id = str(item.get("related_product_id", ""))
+        if not product_id or not related_id:
+            continue
+        item["updated_at"] = now
+        db.product_built_with.update_one(
+            {"product_id": product_id, "related_product_id": related_id},
+            {"$set": item},
+            upsert=True,
+        )
         count += 1
     return count
 
@@ -109,3 +201,4 @@ def record_run_finish(
         update["error"] = error
 
     db.scraper_runs.update_one({"run_id": run_id}, {"$set": update}, upsert=True)
+

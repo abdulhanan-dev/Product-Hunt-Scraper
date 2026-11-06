@@ -1,9 +1,19 @@
 """Scraper module for Stage 1: Daily Leaderboard."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from client import GraphQLClient
-from config import settings
-from parsers import parse_leaderboard_page
+from config import (
+    HASH_PRODUCT_ABOUT_PAGE,
+    HASH_PRODUCT_BUILT_WITH_PAGE,
+    HASH_PRODUCTS_PAGE_LAYOUT,
+    settings,
+)
+from parsers import (
+    parse_leaderboard_page,
+    parse_product_about,
+    parse_product_built_with,
+    parse_product_layout,
+)
 from utils import get_logger
 
 logger = get_logger(__name__, settings.log_level)
@@ -68,3 +78,69 @@ def fetch_daily_leaderboard(
         target_date,
     )
     return all_launches
+
+
+def enrich_product(
+    client: GraphQLClient,
+    product_slug: str,
+    product_id_hint: str = "",
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Retrieve detailed product information, about/media, makers, and built-with data."""
+    logger.info("Enriching product details for slug: %s", product_slug)
+
+    product_data: Dict[str, Any] = {}
+    media_items: List[Dict[str, Any]] = []
+    people: List[Dict[str, Any]] = []
+    built_with: List[Dict[str, Any]] = []
+
+    # 1. Product Layout / Details
+    try:
+        layout_vars = {
+            "slug": product_slug,
+            "includeAlternatives": True,
+            "launchSlug": None,
+        }
+        layout_resp = client.execute_query(
+            operation_name="ProductsPageLayout",
+            variables=layout_vars,
+            sha256_hash=HASH_PRODUCTS_PAGE_LAYOUT,
+        )
+        product_data = parse_product_layout(layout_resp)
+    except Exception as exc:
+        logger.warning("Failed to fetch layout for product %s: %s", product_slug, exc)
+
+    # Use resolved product_id or hint
+    resolved_product_id = product_data.get("product_id") or product_id_hint
+
+    # 2. Product About (media, makers, hunters, pricing)
+    try:
+        about_vars = {"slug": product_slug}
+        about_resp = client.execute_query(
+            operation_name="ProductAboutPage",
+            variables=about_vars,
+            sha256_hash=HASH_PRODUCT_ABOUT_PAGE,
+        )
+        media_items, people, about_info = parse_product_about(
+            about_resp,
+            product_id=resolved_product_id,
+            product_slug=product_slug,
+        )
+        if about_info:
+            product_data.update(about_info)
+    except Exception as exc:
+        logger.warning("Failed to fetch about page for product %s: %s", product_slug, exc)
+
+    # 3. Product Built With
+    try:
+        bw_vars = {"slug": product_slug}
+        bw_resp = client.execute_query(
+            operation_name="ProductBuiltWithPage",
+            variables=bw_vars,
+            sha256_hash=HASH_PRODUCT_BUILT_WITH_PAGE,
+        )
+        built_with = parse_product_built_with(bw_resp, product_id=resolved_product_id)
+    except Exception as exc:
+        logger.warning("Failed to fetch built-with for product %s: %s", product_slug, exc)
+
+    return product_data, media_items, people, built_with
+

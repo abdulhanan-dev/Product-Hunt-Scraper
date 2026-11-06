@@ -12,3 +12,4 @@ __pycache__/
 # Pytest & data
 .pytest_cache/
 storage/
+

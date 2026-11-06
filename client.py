@@ -150,3 +150,4 @@ class GraphQLClient:
     def close(self) -> None:
         """Close the underlying HTTP client."""
         self.client.close()
+

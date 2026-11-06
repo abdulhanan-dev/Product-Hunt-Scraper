@@ -106,3 +106,167 @@ def parse_leaderboard_page(
             launches.append(launch_record)
 
     return launches, has_next_page, end_cursor
+
+
+def parse_product_layout(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse ProductsPageLayout GraphQL response."""
+    data = payload.get("data") or {}
+    product_obj = data.get("product") or data.get("productPage") or {}
+    if not isinstance(product_obj, dict):
+        return {}
+
+    # Extract categories
+    categories_raw = product_obj.get("categories") or []
+    categories: List[str] = []
+    if isinstance(categories_raw, dict) and "edges" in categories_raw:
+        categories = [
+            e.get("node", {}).get("name", "")
+            for e in categories_raw["edges"]
+            if isinstance(e, dict)
+        ]
+    elif isinstance(categories_raw, list):
+        categories = [c.get("name", "") if isinstance(c, dict) else str(c) for c in categories_raw]
+
+    # Social links
+    social_links = product_obj.get("socialLinks") or {}
+    if not isinstance(social_links, dict):
+        social_links = {}
+
+    # Ratings
+    ratings = {
+        "average": product_obj.get("reviewsRating") or (product_obj.get("ratings") or {}).get("average", 0.0),
+        "count": product_obj.get("reviewsCount") or (product_obj.get("ratings") or {}).get("count", 0),
+    }
+
+    return {
+        "product_id": str(product_obj.get("id", "")),
+        "name": product_obj.get("name", ""),
+        "slug": product_obj.get("slug", ""),
+        "tagline": product_obj.get("tagline", ""),
+        "description": product_obj.get("description", ""),
+        "categories": [c for c in categories if c],
+        "ratings": ratings,
+        "pro_con_tags": product_obj.get("proConTags") or [],
+        "awards": product_obj.get("awards") or [],
+        "yc_info": product_obj.get("yc") or product_obj.get("yCombinator") or {},
+        "posts_count": product_obj.get("postsCount", 0),
+        "first_post": product_obj.get("firstPost") or {},
+        "social_links": social_links,
+    }
+
+
+def parse_product_about(
+    payload: Dict[str, Any], product_id: str, product_slug: str
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Parse ProductAboutPage GraphQL response.
+
+    Returns:
+        tuple: (media_items, people, about_info)
+    """
+    data = payload.get("data") or {}
+    product_obj = data.get("product") or data.get("productAbout") or {}
+    if not isinstance(product_obj, dict):
+        return [], [], {}
+
+    media_items: List[Dict[str, Any]] = []
+    media_raw = product_obj.get("media") or []
+    if isinstance(media_raw, dict) and "edges" in media_raw:
+        media_raw = [e.get("node") for e in media_raw["edges"] if isinstance(e, dict)]
+
+    for idx, item in enumerate(media_raw):
+        if not isinstance(item, dict):
+            continue
+        media_url = item.get("url") or item.get("imageUrl") or item.get("videoUrl")
+        if media_url:
+            media_items.append(
+                {
+                    "product_id": product_id,
+                    "product_slug": product_slug,
+                    "media_url": media_url,
+                    "media_type": item.get("type") or item.get("mediaType", "image"),
+                    "priority": idx + 1,
+                }
+            )
+
+    people: List[Dict[str, Any]] = []
+
+    # Makers
+    makers_raw = product_obj.get("makers") or []
+    if isinstance(makers_raw, dict) and "edges" in makers_raw:
+        makers_raw = [e.get("node") for e in makers_raw["edges"] if isinstance(e, dict)]
+
+    for maker in makers_raw:
+        if not isinstance(maker, dict):
+            continue
+        username = maker.get("username", "")
+        if username:
+            people.append(
+                {
+                    "product_id": product_id,
+                    "user_id": str(maker.get("id", "")),
+                    "username": username,
+                    "name": maker.get("name", ""),
+                    "headline": maker.get("headline", ""),
+                    "avatar_url": maker.get("profileImage") or maker.get("avatarUrl", ""),
+                    "role": "maker",
+                }
+            )
+
+    # Hunter
+    hunter = product_obj.get("hunter") or product_obj.get("user")
+    if isinstance(hunter, dict) and hunter.get("username"):
+        people.append(
+            {
+                "product_id": product_id,
+                "user_id": str(hunter.get("id", "")),
+                "username": hunter.get("username", ""),
+                "name": hunter.get("name", ""),
+                "headline": hunter.get("headline", ""),
+                "avatar_url": hunter.get("profileImage") or hunter.get("avatarUrl", ""),
+                "role": "hunter",
+            }
+        )
+
+    about_info = {
+        "pricing_type": product_obj.get("pricingType") or product_obj.get("pricing", ""),
+        "primary_link": product_obj.get("url") or product_obj.get("website", ""),
+    }
+
+    return media_items, people, about_info
+
+
+def parse_product_built_with(
+    payload: Dict[str, Any], product_id: str
+) -> List[Dict[str, Any]]:
+    """Parse ProductBuiltWithPage GraphQL response."""
+    data = payload.get("data") or {}
+    product_obj = data.get("product") or data.get("productBuiltWith") or {}
+    if not isinstance(product_obj, dict):
+        return []
+
+    reviews_obj = product_obj.get("authoredDetailedReviews") or {}
+    edges = reviews_obj.get("edges") or [] if isinstance(reviews_obj, dict) else []
+
+    built_with_items: List[Dict[str, Any]] = []
+    for edge in edges:
+        node = edge.get("node") if isinstance(edge, dict) and "node" in edge else edge
+        if not isinstance(node, dict):
+            continue
+
+        related_prod = node.get("product") or {}
+        related_id = str(related_prod.get("id", ""))
+        if not related_id:
+            continue
+
+        built_with_items.append(
+            {
+                "product_id": product_id,
+                "related_product_id": related_id,
+                "related_product_name": related_prod.get("name", ""),
+                "related_product_slug": related_prod.get("slug", ""),
+                "shoutout_note": node.get("shoutoutNote") or "",
+            }
+        )
+
+    return built_with_items
+

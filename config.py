@@ -67,3 +67,4 @@ HASH_DETAILED_REVIEWS_FEED = "10f4714cc0f69c7edad99af5edd7cfe6405edd347b67cb161c
 
 # Singleton settings
 settings = Settings()
+

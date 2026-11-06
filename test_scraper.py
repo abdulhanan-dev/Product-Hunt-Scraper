@@ -207,3 +207,205 @@ def test_upsert_launches():
     saved_count = upsert_launches(mock_db, launches)
     assert saved_count == 2
     assert mock_db.launches.update_one.call_count == 2
+
+
+# --- 5. Stage 2: Product Enrichment Tests ---
+
+def test_parse_product_layout():
+    from parsers import parse_product_layout
+
+    payload = {
+        "data": {
+            "product": {
+                "id": "prod_123",
+                "name": "Super AI",
+                "slug": "super-ai",
+                "tagline": "The best AI",
+                "description": "An AI platform",
+                "reviewsRating": 4.9,
+                "reviewsCount": 45,
+                "categories": [{"name": "AI"}, {"name": "Productivity"}],
+                "proConTags": ["fast", "easy to use"],
+                "awards": ["Product of the Day #1"],
+                "yc": {"batch": "W24"},
+                "postsCount": 3,
+                "socialLinks": {"website": "https://super.ai"},
+            }
+        }
+    }
+
+    product = parse_product_layout(payload)
+    assert product["product_id"] == "prod_123"
+    assert product["name"] == "Super AI"
+    assert product["slug"] == "super-ai"
+    assert product["ratings"]["average"] == 4.9
+    assert product["ratings"]["count"] == 45
+    assert product["categories"] == ["AI", "Productivity"]
+    assert product["pro_con_tags"] == ["fast", "easy to use"]
+    assert product["awards"] == ["Product of the Day #1"]
+    assert product["yc_info"] == {"batch": "W24"}
+    assert product["posts_count"] == 3
+
+
+def test_parse_product_about():
+    from parsers import parse_product_about
+
+    payload = {
+        "data": {
+            "product": {
+                "pricingType": "Free",
+                "url": "https://super.ai",
+                "media": [
+                    {"url": "https://ph.co/img1.png", "type": "image"},
+                    {"url": "https://ph.co/vid1.mp4", "type": "video"},
+                ],
+                "makers": [
+                    {
+                        "id": "u_1",
+                        "username": "sarah_c",
+                        "name": "Sarah Connor",
+                        "headline": "Founder",
+                        "profileImage": "https://ph.co/avatar1.jpg",
+                    }
+                ],
+                "hunter": {
+                    "id": "u_2",
+                    "username": "kevin_h",
+                    "name": "Kevin Hunter",
+                    "profileImage": "https://ph.co/avatar2.jpg",
+                },
+            }
+        }
+    }
+
+    media, people, about_info = parse_product_about(payload, product_id="prod_123", product_slug="super-ai")
+
+    assert len(media) == 2
+    assert media[0]["media_url"] == "https://ph.co/img1.png"
+    assert media[0]["media_type"] == "image"
+    assert media[1]["media_url"] == "https://ph.co/vid1.mp4"
+
+    assert len(people) == 2
+    # Maker
+    assert people[0]["username"] == "sarah_c"
+    assert people[0]["role"] == "maker"
+    # Hunter
+    assert people[1]["username"] == "kevin_h"
+    assert people[1]["role"] == "hunter"
+
+    assert about_info["pricing_type"] == "Free"
+    assert about_info["primary_link"] == "https://super.ai"
+
+
+def test_parse_product_built_with():
+    from parsers import parse_product_built_with
+
+    payload = {
+        "data": {
+            "product": {
+                "authoredDetailedReviews": {
+                    "edges": [
+                        {
+                            "node": {
+                                "shoutoutNote": "Built with Next.js",
+                                "product": {
+                                    "id": "prod_nextjs",
+                                    "name": "Next.js",
+                                    "slug": "next-js",
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+    built_with = parse_product_built_with(payload, product_id="prod_123")
+    assert len(built_with) == 1
+    assert built_with[0]["product_id"] == "prod_123"
+    assert built_with[0]["related_product_id"] == "prod_nextjs"
+    assert built_with[0]["related_product_name"] == "Next.js"
+    assert built_with[0]["shoutout_note"] == "Built with Next.js"
+
+
+def test_enrich_product_integration():
+    from scraper import enrich_product
+
+    mock_client = MagicMock(spec=GraphQLClient)
+
+    # Mock responses for layout, about, built_with
+    mock_client.execute_query.side_effect = [
+        {
+            "data": {
+                "product": {
+                    "id": "prod_999",
+                    "name": "Test App",
+                    "slug": "test-app",
+                    "reviewsRating": 5.0,
+                    "reviewsCount": 10,
+                }
+            }
+        },
+        {
+            "data": {
+                "product": {
+                    "pricingType": "Paid",
+                    "media": [{"url": "https://img.png", "type": "image"}],
+                    "makers": [{"id": "m1", "username": "maker1", "name": "Maker One"}],
+                }
+            }
+        },
+        {
+            "data": {
+                "product": {
+                    "authoredDetailedReviews": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "shoutoutNote": "Used Postgres",
+                                    "product": {"id": "p_db", "name": "Postgres", "slug": "postgres"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    ]
+
+    product_data, media, people, bw = enrich_product(mock_client, product_slug="test-app")
+
+    assert product_data["name"] == "Test App"
+    assert product_data["pricing_type"] == "Paid"
+    assert len(media) == 1
+    assert len(people) == 1
+    assert len(bw) == 1
+    assert mock_client.execute_query.call_count == 3
+
+
+def test_upsert_product_entities():
+    from database import (
+        upsert_product,
+        upsert_product_built_with,
+        upsert_product_media,
+        upsert_product_people,
+    )
+
+    mock_db = MagicMock()
+
+    upsert_product(mock_db, {"product_id": "p1", "name": "App 1"})
+    assert mock_db.products.update_one.call_count == 1
+
+    media_count = upsert_product_media(mock_db, [{"product_id": "p1", "media_url": "https://img"}])
+    assert media_count == 1
+    assert mock_db.product_media.update_one.call_count == 1
+
+    people_count = upsert_product_people(mock_db, [{"product_id": "p1", "username": "u1", "role": "maker"}])
+    assert people_count == 1
+    assert mock_db.product_people.update_one.call_count == 1
+
+    bw_count = upsert_product_built_with(mock_db, [{"product_id": "p1", "related_product_id": "p2"}])
+    assert bw_count == 1
+    assert mock_db.product_built_with.update_one.call_count == 1
+
