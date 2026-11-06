@@ -187,7 +187,7 @@ def test_fetch_daily_leaderboard_pagination():
 
     mock_client.execute_query.side_effect = [page1, page2]
 
-    results = fetch_daily_leaderboard(mock_client, target_date="2026-11-05")
+    results = fetch_daily_leaderboard(mock_client, target_date="2026-11-05", operation_hash="test_hash")
 
     assert len(results) == 2
     assert results[0]["post_id"] == "1"
@@ -669,6 +669,7 @@ def test_product_deduplication_skips_existing(mocker):
     mocker.patch("main.record_run_start")
     mocker.patch("main.record_run_finish")
     mocker.patch("main.upsert_launches", return_value=1)
+    mocker.patch("main._ensure_hashes")
 
     mock_enrich = mocker.patch("main.enrich_product")
 

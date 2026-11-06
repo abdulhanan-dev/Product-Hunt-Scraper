@@ -3,9 +3,11 @@
 import argparse
 import sys
 import time
+from importlib import reload
 from typing import Optional
 from uuid import uuid4
 from client import GraphQLClient
+import config as _config_module
 from config import settings
 from database import (
     ensure_indexes,
@@ -35,6 +37,68 @@ from scraper import (
 from utils import get_logger, get_pacific_yesterday
 
 logger = get_logger("main", settings.log_level)
+
+
+def _ensure_hashes(client: GraphQLClient) -> None:
+    """Guarantee all GraphQL hashes are present before scraping begins.
+
+    Checks whether the leaderboard hash (the only one stored in settings) is
+    populated.  If it is missing or still an empty string — meaning .env was
+    never populated or the value was cleared — the extractor is run
+    automatically so the pipeline never blocks on a missing hash.
+
+    After extraction the .env file is updated (inside extract_hashes) and
+    settings is reloaded so every subsequent call that reads
+    ``settings.product_hunt_leaderboard_hash`` gets the fresh value.
+    The client's Cookie and User-Agent headers are also updated in place.
+    """
+    # Reload settings from .env to pick up any value written by a previous
+    # extraction in the same process (e.g. a prior --date run in the same session).
+    reload(_config_module)
+    current_hash = _config_module.settings.product_hunt_leaderboard_hash
+
+    if current_hash:
+        logger.info(
+            "[pre-flight] Leaderboard hash present (%s...). Skipping extraction.",
+            current_hash[:12],
+        )
+        return
+
+    logger.warning(
+        "[pre-flight] No leaderboard hash found in .env. "
+        "Launching headless browser to extract hashes automatically..."
+    )
+
+    try:
+        from extract_hashes import extract_hashes_and_cookies
+        extracted, cookies, ua = extract_hashes_and_cookies()
+    except Exception as exc:
+        logger.error("[pre-flight] Hash extraction failed: %s", exc)
+        logger.error(
+            "[pre-flight] Please run `python extract_hashes.py` manually, "
+            "then retry."
+        )
+        sys.exit(1)
+
+    if not extracted.get("LeaderboardDailyPage"):
+        logger.error(
+            "[pre-flight] Extraction completed but LeaderboardDailyPage hash "
+            "was not captured. Check your network connection and try again."
+        )
+        sys.exit(1)
+
+    # Apply fresh cookies / UA to the client that will be used for scraping
+    if cookies:
+        client.client.headers["Cookie"] = cookies
+    if ua:
+        client.client.headers["User-Agent"] = ua
+
+    # Reload settings so the rest of the pipeline reads the updated hash
+    reload(_config_module)
+    logger.info(
+        "[pre-flight] Hash extraction complete. LeaderboardDailyPage: %s...",
+        extracted["LeaderboardDailyPage"][:12],
+    )
 
 
 def run_pipeline(
@@ -72,6 +136,9 @@ def run_pipeline(
 
     client = GraphQLClient()
     try:
+        # Pre-flight: ensure all hashes are present before scraping begins
+        _ensure_hashes(client)
+
         # 2. Stage 1: Leaderboard
         launches = fetch_daily_leaderboard(client=client, target_date=target_date)
         saved_count = upsert_launches(db, launches)
