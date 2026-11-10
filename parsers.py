@@ -160,11 +160,24 @@ def parse_product_layout(payload: Dict[str, Any]) -> Dict[str, Any]:
         "categories": [c for c in categories if c],
         "ratings": ratings,
         "pro_con_tags": product_obj.get("proConTags") or [],
-        "awards": product_obj.get("awards") or [],
+        "awards": product_obj.get("awards") or {},
         "yc_info": product_obj.get("yc") or product_obj.get("yCombinator") or {},
         "posts_count": product_obj.get("postsCount", 0),
         "first_post": product_obj.get("firstPost") or {},
         "social_links": social_links,
+        # New fields from updated ProductsPageLayout
+        "website_url":   product_obj.get("websiteUrl") or product_obj.get("cleanUrl") or "",
+        "twitter_url":   product_obj.get("twitterUrl") or "",
+        "facebook_url":  product_obj.get("facebookUrl") or "",
+        "instagram_url": product_obj.get("instagramUrl") or "",
+        "linkedin_url":  product_obj.get("linkedinUrl") or "",
+        "github_url":    product_obj.get("githubUrl") or "",
+        "logo_uuid":     product_obj.get("logoUuid") or "",
+        "followers_count": int(product_obj.get("followersCount") or 0),
+        "reviews_count": int(product_obj.get("reviewsCount") or 0),
+        "reviews_rating": float(product_obj.get("reviewsRating") or 0),
+        "pricing_type":  product_obj.get("pricingType") or "",
+        "primary_link":  product_obj.get("websiteUrl") or product_obj.get("url") or "",
     }
 
 
@@ -475,82 +488,186 @@ def parse_detailed_reviews_feed(
     return reviews, has_next_page, end_cursor, discovered_users
 
 
+
+
+def _to_int(val) -> int:
+    """Safely convert GraphQL int field (may be a connection dict) to int."""
+    if isinstance(val, int):
+        return val
+    if isinstance(val, dict):
+        # connection object like {"totalCount": 42}
+        return int(val.get("totalCount") or val.get("count") or 0)
+    try:
+        return int(val or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def parse_profile_ssr(html_text: str, username: str) -> Optional[Dict[str, Any]]:
-    """Parse Apollo SSR data from a public Product Hunt profile HTML page."""
+    """Parse Apollo SSR data from a public Product Hunt profile HTML page.
+
+    Product Hunt uses ApolloSSRDataTransport which pushes rehydration payloads:
+        (window[Symbol.for("ApolloSSRDataTransport")] ??= []).push({rehydrate: {...}})
+
+    Each rehydrate entry has shape: { data: { profile: <User>, ... }, complete: bool }
+    We walk every entry looking for a User object matching the target username.
+    """
     import json
     import re
 
     soup = BeautifulSoup(html_text, "html.parser")
     profile_data: Optional[Dict[str, Any]] = None
-    decoder = json.JSONDecoder()
 
-    # Search script tags for ApolloSSRDataTransport or profile query
-    scripts = soup.find_all("script")
-    for script in scripts:
+    for script in soup.find_all("script"):
         content = script.string or script.text or ""
-        if not content:
+        if "ApolloSSRDataTransport" not in content:
             continue
 
-        if "ProfileLayoutQuery" in content or "ProfileAboutPage" in content or "ApolloSSRDataTransport" in content or "profile" in content:
-            # Safely replace JS undefined with null
-            sanitized = re.sub(r':\s*undefined\b', ': null', content)
+        sanitized = re.sub(r':\s*undefined\b', ': null', content)
+        # Extract JSON from .push({...})
+        m = re.search(r'\.push\((\{.+)', sanitized, re.DOTALL)
+        if not m:
+            continue
+        json_str = m.group(1).rstrip(');').rstrip(')')
 
-            # Search for JSON start positions '{'
-            pos = 0
-            while True:
-                idx = sanitized.find('{', pos)
-                if idx == -1:
+        try:
+            pushed = json.loads(json_str)
+        except Exception:
+            try:
+                pushed, _ = json.JSONDecoder().raw_decode(json_str)
+            except Exception:
+                continue
+
+        rehydrate = pushed.get("rehydrate", {})
+        if not isinstance(rehydrate, dict):
+            continue
+
+        def _walk(obj: Any, depth: int = 0) -> Optional[Dict]:
+            if depth > 7 or not isinstance(obj, dict):
+                return None
+            if obj.get("__typename") == "User" and obj.get("username"):
+                if obj["username"].lower() == username.lower():
+                    return obj
+                if obj.get("headline") is not None:
+                    return obj
+            best = None
+            for v in obj.values():
+                if isinstance(v, dict):
+                    r = _walk(v, depth + 1)
+                    if r:
+                        if r.get("links") or (best is None):
+                            best = r
+                elif isinstance(v, list):
+                    for item in v:
+                        r = _walk(item, depth + 1)
+                        if r:
+                            if r.get("links") or (best is None):
+                                best = r
+            return best
+
+        for entry in rehydrate.values():
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data") or {}
+            # Check common keys first
+            for k in ("profile", "user"):
+                cand = data.get(k)
+                if isinstance(cand, dict) and cand.get("username"):
+                    if profile_data is None:
+                        profile_data = cand
+                    elif cand.get("links") and not profile_data.get("links"):
+                        # Prefer the entry that has social links
+                        profile_data = cand
                     break
-                try:
-                    obj, end_idx = decoder.raw_decode(sanitized[idx:])
-                    pos = idx + end_idx
-                    if isinstance(obj, dict):
-                        cand = (
-                            obj.get("data", {}).get("profile")
-                            or obj.get("value", {}).get("data", {}).get("profile")
-                            or obj.get("profile")
-                        )
-                        if cand and isinstance(cand, dict) and (cand.get("id") or cand.get("name") or cand.get("username")):
-                            profile_data = cand
-                            break
-                except Exception:
-                    pos = idx + 1
+            if not profile_data:
+                profile_data = _walk(data)
+            # Always check if a richer entry (with links) exists
+            elif not profile_data.get("links"):
+                richer = _walk(data)
+                if richer and richer.get("links"):
+                    profile_data = richer
+        # After scanning all entries, keep the richest profile found
         if profile_data:
-            break
+            break  # found in this script tag, no need to check others
 
     if not profile_data:
         return None
 
-    # Social links decoding
-    social_links_raw = profile_data.get("socialLinks") or profile_data.get("links") or {}
+    # ── Decode links (new API: list of {name, encodedUrl}) ──
+    links_raw = profile_data.get("links") or profile_data.get("socialLinks") or {}
     decoded_links: Dict[str, str] = {}
-    if isinstance(social_links_raw, dict):
-        for k, v in social_links_raw.items():
-            if isinstance(v, dict) and "encodedUrl" in v:
-                decoded_links[k] = decode_base64_url(v["encodedUrl"])
-            elif isinstance(v, str):
-                decoded_links[k] = v
-    elif isinstance(social_links_raw, list):
-        for item in social_links_raw:
-            if isinstance(item, dict):
-                label = item.get("type") or item.get("label", "link")
-                url = item.get("url") or decode_base64_url(item.get("encodedUrl", ""))
-                if url:
-                    decoded_links[label] = url
+
+    if isinstance(links_raw, list):
+        for item in links_raw:
+            if not isinstance(item, dict):
+                continue
+            name_raw = (item.get("type") or item.get("name") or "link").lower()
+            url = item.get("url", "")
+            if not url:
+                encoded = item.get("encodedUrl", "")
+                url = decode_base64_url(encoded) if encoded else ""
+            if not url:
+                continue
+            key = (
+                "twitter"   if "twitter"   in name_raw or "x.com"        in url.lower() else
+                "github"    if "github"    in name_raw or "github.com"    in url.lower() else
+                "linkedin"  if "linkedin"  in name_raw or "linkedin.com"  in url.lower() else
+                "facebook"  if "facebook"  in name_raw or "facebook.com"  in url.lower() else
+                "instagram" if "instagram" in name_raw or "instagram.com" in url.lower() else
+                "youtube"   if "youtube"   in name_raw or "youtube.com"   in url.lower() else
+                "website"   if name_raw in ("link", "personal", "blog", "website", "portfolio") else
+                name_raw
+            )
+            decoded_links[key] = url
+
+    elif isinstance(links_raw, dict):
+        for k, v in links_raw.items():
+            url = (v.get("url") or decode_base64_url(v.get("encodedUrl", ""))) if isinstance(v, dict) else str(v)
+            if url:
+                decoded_links[k.lower()] = url
+
+    # Supplement from top-level fields
+    tw = profile_data.get("twitterUsername") or ""
+    if tw and "twitter" not in decoded_links:
+        decoded_links["twitter"] = f"https://twitter.com/{tw.lstrip('@')}"
+    ws = profile_data.get("websiteUrl") or ""
+    if ws and "website" not in decoded_links:
+        decoded_links["website"] = ws
+
+    # ── Flatten badges ──
+    raw_badges = profile_data.get("badges") or []
+    if isinstance(raw_badges, dict) and "edges" in raw_badges:
+        raw_badges = [e.get("node", {}) for e in raw_badges["edges"] if isinstance(e, dict)]
+    badges = []
+    for b in (raw_badges if isinstance(raw_badges, list) else []):
+        if isinstance(b, dict):
+            badges.append({
+                "title":       b.get("title") or b.get("name") or b.get("awardKind") or "",
+                "description": b.get("description") or "",
+                "badge_uuid":  b.get("uuid") or b.get("imageUuid") or "",
+                "period":      b.get("period") or "",
+            })
 
     return {
-        "username": username.lower(),
-        "user_id": str(profile_data.get("id", "")),
-        "name": profile_data.get("name", ""),
-        "headline": profile_data.get("headline", ""),
-        "about": profile_data.get("about", ""),
-        "is_maker": bool(profile_data.get("isMaker", False)),
-        "is_verified": bool(profile_data.get("isVerified", False)),
-        "verified": bool(profile_data.get("isVerified", False)),
-        "streak": profile_data.get("streak", 0),
-        "kitty_coins": profile_data.get("kittyCoins", 0),
-        "created_at": profile_data.get("createdAt"),
-        "badges": profile_data.get("badges") or [],
-        "social_links": decoded_links,
+        "username":        username.lower(),
+        "user_id":         str(profile_data.get("id", "")),
+        "name":            profile_data.get("name", "") or profile_data.get("displayName", ""),
+        "headline":        profile_data.get("headline", ""),
+        "about":           profile_data.get("about", ""),
+        "avatar_url":      profile_data.get("profileImage") or profile_data.get("avatarUrl") or "",
+        "header_uuid":     profile_data.get("headerUuid") or "",
+        "is_maker":        bool(profile_data.get("isMaker", False)),
+        "is_verified":     bool(profile_data.get("isVerified", False)),
+        "verified":        bool(profile_data.get("isVerified", False)),
+        "followers_count": _to_int(profile_data.get("followersCount")),
+        "following_count": _to_int(profile_data.get("followingsCount")),
+        "products_count":  _to_int(profile_data.get("productsCount")),
+        "reviews_count":   _to_int(profile_data.get("reviewsCount")),
+        "votes_count":     _to_int(profile_data.get("votesCount")),
+        "streak":          _to_int(profile_data.get("visitStreak") or profile_data.get("streak")),
+        "created_at":      profile_data.get("createdAt"),
+        "twitter_username": tw,
+        "website_url":     ws,
+        "social_links":    decoded_links,
+        "badges":          badges,
     }
-

@@ -1,6 +1,8 @@
+
 # Product Hunt Scraper
 
 ## Project Overview and Coding-Agent Implementation Specification
+
 
 **Document purpose:** Use this file as the project brief and
 implementation guide for a coding agent.\

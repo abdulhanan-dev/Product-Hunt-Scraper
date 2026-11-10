@@ -3,6 +3,7 @@
 import base64
 from datetime import datetime, timedelta
 import logging
+import os
 import re
 import sys
 from typing import Any, Dict
@@ -24,14 +25,16 @@ def decode_base64_url(encoded_val: str) -> str:
     if not encoded_val:
         return ""
     try:
+        # Strip whitespace and newlines that Product Hunt embeds in encodedUrl
+        clean = encoded_val.replace("\n", "").replace("\r", "").replace(" ", "").strip()
         # Add padding if needed
-        padding = 4 - (len(encoded_val) % 4)
+        padding = 4 - (len(clean) % 4)
         if padding != 4:
-            encoded_val += "=" * padding
-        decoded = base64.b64decode(encoded_val).decode("utf-8", errors="ignore")
+            clean += "=" * padding
+        decoded = base64.b64decode(clean).decode("utf-8", errors="ignore")
         return decoded
     except Exception:
-        return encoded_val
+        return ""
 
 
 def sanitize_headers_for_logging(headers: Dict[str, Any]) -> Dict[str, str]:
@@ -67,7 +70,7 @@ class RedactingFormatter(logging.Formatter):
 
 
 def get_logger(name: str = "product_hunt_scraper", level: str = "INFO") -> logging.Logger:
-    """Configure and return a standard console logger."""
+    """Configure and return a standard console logger with shared live file handler."""
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     if not logger.handlers:
@@ -79,4 +82,21 @@ def get_logger(name: str = "product_hunt_scraper", level: str = "INFO") -> loggi
             )
         )
         logger.addHandler(handler)
+
+        # Also write to storage/live_stream.log for real-time frontend streaming
+        try:
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, "live_stream.log")
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setFormatter(
+                RedactingFormatter(
+                    fmt="%(asctime)s [%(levelname)s] %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            logger.addHandler(file_handler)
+        except Exception:
+            pass
+
     return logger

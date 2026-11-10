@@ -3,7 +3,9 @@
 import argparse
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from importlib import reload
+from threading import Lock
 from typing import Optional
 from uuid import uuid4
 from client import GraphQLClient
@@ -38,8 +40,169 @@ from utils import get_logger, get_pacific_yesterday
 
 logger = get_logger("main", settings.log_level)
 
+# Thread-safe counter lock for progress logging
+_progress_lock = Lock()
 
-def _ensure_hashes(client: GraphQLClient) -> None:
+
+def _process_product(
+    launch: dict,
+    idx: int,
+    total: int,
+    db,
+    force: bool = False,
+) -> dict:
+    """Process a single product through Stage 2 (enrichment) and Stage 3 (comments/reviews).
+    
+    Returns a dict with processing results and discovered usernames.
+    
+    If ANY operation fails (even after retries), the error is logged but the function
+    continues to attempt remaining operations to maximize data collection.
+    """
+    product_slug = launch.get("product_slug") or launch.get("post_slug")
+    post_slug = launch.get("post_slug") or product_slug
+    product_id = launch.get("product_id", "")
+    
+    result = {
+        "enriched": False,
+        "skipped": False,
+        "error": None,
+        "media_count": 0,
+        "people_count": 0,
+        "bw_count": 0,
+        "comments_count": 0,
+        "reviews_count": 0,
+        "usernames": set(),
+        "partial_failure": False,  # Track if some operations failed
+    }
+    
+    if not product_slug:
+        result["skipped"] = True
+        return result
+
+    # Each thread gets its own GraphQL client to avoid sharing connection pools
+    client = GraphQLClient()
+    
+    try:
+        # Strict Deduplication Check: Skip if product already present in DB
+        existing_product = None
+        if product_id:
+            existing_product = db.products.find_one({"product_id": str(product_id)})
+        if not existing_product and product_slug:
+            existing_product = db.products.find_one({"slug": product_slug})
+
+        if existing_product and not force:
+            with _progress_lock:
+                logger.info(
+                    "[%d/%d] Product '%s' (id: %s) ALREADY IN DATABASE. Skipping Stage 2 & 3.",
+                    idx,
+                    total,
+                    product_slug,
+                    product_id,
+                )
+            result["skipped"] = True
+            return result
+
+        # NEW PRODUCT: Run enrichment + comments + reviews
+        with _progress_lock:
+            logger.info(
+                "[%d/%d] NEW PRODUCT '%s' (post: %s, id: %s) -> Running enrichment...",
+                idx,
+                total,
+                product_slug,
+                post_slug,
+                product_id,
+            )
+
+        # Stage 2: Product Details, About & Built-With
+        # Wrap in try-except to continue even if enrichment fails
+        try:
+            product_data, media_items, people, built_with = enrich_product(
+                client=client,
+                product_slug=product_slug,
+                product_id_hint=product_id,
+            )
+
+            if product_data:
+                upsert_product(db, product_data)
+                result["enriched"] = True
+
+            if media_items:
+                result["media_count"] = upsert_product_media(db, media_items)
+
+            if people:
+                result["people_count"] = upsert_product_people(db, people)
+                for p in people:
+                    if p.get("username"):
+                        result["usernames"].add(p["username"])
+
+            if built_with:
+                result["bw_count"] = upsert_product_built_with(db, built_with)
+        except Exception as exc:
+            with _progress_lock:
+                logger.error(
+                    "❌ Failed to enrich product '%s' (%s): %s. Continuing to comments/reviews...",
+                    product_slug,
+                    product_id,
+                    exc,
+                )
+            result["partial_failure"] = True
+
+        # Stage 3a: Comments (CRITICAL: uses post_slug!)
+        # Continue even if enrichment failed
+        if post_slug:
+            try:
+                comments, comment_users = fetch_product_comments(
+                    client=client, post_slug=post_slug, product_id=product_id
+                )
+                if comments:
+                    result["comments_count"] = upsert_comments(db, comments)
+                result["usernames"].update(comment_users)
+            except Exception as exc:
+                with _progress_lock:
+                    logger.error(
+                        "❌ Failed to fetch comments for '%s' (%s): %s",
+                        product_slug,
+                        product_id,
+                        exc,
+                    )
+                result["partial_failure"] = True
+
+        # Stage 3b: Detailed Reviews (gated by count)
+        # Continue even if comments failed
+        try:
+            reviews, review_users = fetch_product_reviews(
+                client=client, product_slug=product_slug, product_id=product_id
+            )
+            if reviews:
+                result["reviews_count"] = upsert_reviews(db, reviews)
+            result["usernames"].update(review_users)
+        except Exception as exc:
+            with _progress_lock:
+                logger.error(
+                    "❌ Failed to fetch reviews for '%s' (%s): %s",
+                    product_slug,
+                    product_id,
+                    exc,
+                )
+            result["partial_failure"] = True
+
+    except Exception as exc:
+        # Catch-all for unexpected errors (DB connection issues, etc.)
+        with _progress_lock:
+            logger.error(
+                "❌ Unexpected error processing product '%s' (%s): %s",
+                product_slug,
+                product_id,
+                exc,
+            )
+        result["error"] = str(exc)
+    finally:
+        client.close()
+    
+    return result
+
+
+def _ensure_hashes(client: GraphQLClient, target_date: str) -> Optional[str]:
     """Guarantee all GraphQL hashes are present before scraping begins.
 
     Checks whether the leaderboard hash (the only one stored in settings) is
@@ -47,13 +210,18 @@ def _ensure_hashes(client: GraphQLClient) -> None:
     never populated or the value was cleared — the extractor is run
     automatically so the pipeline never blocks on a missing hash.
 
+    The extractor navigates to the dated leaderboard URL
+    (/leaderboard/daily/YYYY/MM/DD) so the page loads the correct date's
+    data and fires all the relevant GraphQL persisted queries.
+
     After extraction the .env file is updated (inside extract_hashes) and
     settings is reloaded so every subsequent call that reads
     ``settings.product_hunt_leaderboard_hash`` gets the fresh value.
     The client's Cookie and User-Agent headers are also updated in place.
+    
+    Returns:
+        The leaderboard hash (either existing or freshly extracted)
     """
-    # Reload settings from .env to pick up any value written by a previous
-    # extraction in the same process (e.g. a prior --date run in the same session).
     reload(_config_module)
     current_hash = _config_module.settings.product_hunt_leaderboard_hash
 
@@ -62,16 +230,26 @@ def _ensure_hashes(client: GraphQLClient) -> None:
             "[pre-flight] Leaderboard hash present (%s...). Skipping extraction.",
             current_hash[:12],
         )
-        return
+        return current_hash
+
+    # Build the dated URL so the leaderboard page loads the right day
+    try:
+        year, month, day = target_date.split("-")
+        seed_url = (
+            f"https://www.producthunt.com/leaderboard/daily/{year}/{month}/{day}"
+        )
+    except Exception:
+        seed_url = "https://www.producthunt.com/leaderboard/daily"
 
     logger.warning(
         "[pre-flight] No leaderboard hash found in .env. "
-        "Launching headless browser to extract hashes automatically..."
+        "Launching headless browser to extract hashes from %s ...",
+        seed_url,
     )
 
     try:
         from extract_hashes import extract_hashes_and_cookies
-        extracted, cookies, ua = extract_hashes_and_cookies()
+        extracted, cookies, ua = extract_hashes_and_cookies(url=seed_url)
     except Exception as exc:
         logger.error("[pre-flight] Hash extraction failed: %s", exc)
         logger.error(
@@ -95,10 +273,15 @@ def _ensure_hashes(client: GraphQLClient) -> None:
 
     # Reload settings so the rest of the pipeline reads the updated hash
     reload(_config_module)
+    from config import settings as _reloaded_settings
     logger.info(
         "[pre-flight] Hash extraction complete. LeaderboardDailyPage: %s...",
         extracted["LeaderboardDailyPage"][:12],
     )
+    
+    # Pass the extracted hash to the GraphQL client for immediate use
+    # This avoids the second extraction attempt in fetch_daily_leaderboard
+    return extracted["LeaderboardDailyPage"]
 
 
 def run_pipeline(
@@ -135,12 +318,17 @@ def run_pipeline(
         sys.exit(1)
 
     client = GraphQLClient()
+    leaderboard_hash = None
     try:
         # Pre-flight: ensure all hashes are present before scraping begins
-        _ensure_hashes(client)
+        leaderboard_hash = _ensure_hashes(client, target_date)
 
         # 2. Stage 1: Leaderboard
-        launches = fetch_daily_leaderboard(client=client, target_date=target_date)
+        launches = fetch_daily_leaderboard(
+            client=client, 
+            target_date=target_date,
+            operation_hash=leaderboard_hash
+        )
         saved_count = upsert_launches(db, launches)
         logger.info("Stage 1 complete: %d launches saved/updated.", saved_count)
 
@@ -148,103 +336,60 @@ def run_pipeline(
             logger.info("Applying limit: processing first %d of %d launches", limit, len(launches))
             launches = launches[:limit]
 
-        # 3. Stage 2: Product Enrichment (With Strict Deduplication)
-        logger.info("Starting Stage 2: Checking %d products for new entries...", len(launches))
+        # 3. Stage 2 & 3: Product Enrichment + Comments/Reviews (CONCURRENT)
+        logger.info("Starting Stage 2 & 3: Concurrent processing of %d products...", len(launches))
         enriched_products_count = 0
         skipped_products_count = 0
+        partial_failure_count = 0
         total_media_count = 0
         total_people_count = 0
         total_bw_count = 0
         total_comments_count = 0
         total_reviews_count = 0
         new_discovered_usernames: set[str] = set()
-
-        for idx, launch in enumerate(launches, 1):
-            product_slug = launch.get("product_slug") or launch.get("post_slug")
-            post_slug = launch.get("post_slug") or product_slug
-            product_id = launch.get("product_id", "")
-            if not product_slug:
-                continue
-
-            # Enforce request delay between products
-            client._apply_delay()
-
-            # Strict Deduplication Check: Skip if product already present in DB
-            existing_product = None
-            if product_id:
-                existing_product = db.products.find_one({"product_id": str(product_id)})
-            if not existing_product and product_slug:
-                existing_product = db.products.find_one({"slug": product_slug})
-
-            if existing_product and not force:
-                logger.info(
-                    "[%d/%d] Product '%s' (id: %s) ALREADY IN DATABASE. Skipping Stage 2 & 3.",
-                    idx,
-                    len(launches),
-                    product_slug,
-                    product_id,
-                )
-                skipped_products_count += 1
-                continue
-
-            # NEW PRODUCT: Run all 3 stages for it!
-            logger.info(
-                "[%d/%d] NEW PRODUCT '%s' (post: %s, id: %s) -> Running enrichment...",
-                idx,
-                len(launches),
-                product_slug,
-                post_slug,
-                product_id,
-            )
-
-            try:
-                # 3.1 Product Details, About & Built-With
-                product_data, media_items, people, built_with = enrich_product(
-                    client=client,
-                    product_slug=product_slug,
-                    product_id_hint=product_id,
-                )
-
-                if product_data:
-                    upsert_product(db, product_data)
-                    enriched_products_count += 1
-
-                if media_items:
-                    total_media_count += upsert_product_media(db, media_items)
-
-                if people:
-                    total_people_count += upsert_product_people(db, people)
-                    for p in people:
-                        if p.get("username"):
-                            new_discovered_usernames.add(p["username"])
-
-                if built_with:
-                    total_bw_count += upsert_product_built_with(db, built_with)
-
-                # 3.2 Comments (CRITICAL: uses post_slug!)
-                if post_slug:
-                    comments, comment_users = fetch_product_comments(
-                        client=client, post_slug=post_slug, product_id=product_id
+        
+        # Process products concurrently with a thread pool
+        # Adjust max_workers based on rate limits and server capacity
+        # With increased delays (2.5s) and conservative worker count,
+        # we balance speed with rate limit safety
+        MAX_WORKERS = 3  # Process 3 products concurrently (conservative for rate limits)
+        
+        logger.info("Using %d concurrent workers for product processing", MAX_WORKERS)
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Submit all product processing tasks
+            future_to_launch = {
+                executor.submit(_process_product, launch, idx, len(launches), db, force): (idx, launch)
+                for idx, launch in enumerate(launches, 1)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_launch):
+                idx, launch = future_to_launch[future]
+                try:
+                    result = future.result()
+                    
+                    if result["skipped"]:
+                        skipped_products_count += 1
+                    elif result["enriched"]:
+                        enriched_products_count += 1
+                    
+                    if result.get("partial_failure"):
+                        partial_failure_count += 1
+                    
+                    total_media_count += result["media_count"]
+                    total_people_count += result["people_count"]
+                    total_bw_count += result["bw_count"]
+                    total_comments_count += result["comments_count"]
+                    total_reviews_count += result["reviews_count"]
+                    new_discovered_usernames.update(result["usernames"])
+                    
+                except Exception as exc:
+                    logger.error(
+                        "Unexpected error in worker thread for launch %d: %s",
+                        idx,
+                        exc,
                     )
-                    if comments:
-                        total_comments_count += upsert_comments(db, comments)
-                    new_discovered_usernames.update(comment_users)
-
-                # 3.3 Detailed Reviews (gated by count)
-                reviews, review_users = fetch_product_reviews(
-                    client=client, product_slug=product_slug, product_id=product_id
-                )
-                if reviews:
-                    total_reviews_count += upsert_reviews(db, reviews)
-                new_discovered_usernames.update(review_users)
-
-            except Exception as exc:
-                logger.error(
-                    "Error enriching product '%s' (%s): %s. Moving to next product.",
-                    product_slug,
-                    product_id,
-                    exc,
-                )
 
         # 4. Stage 3: Public Profile Extraction for newly discovered users
         logger.info(
@@ -309,6 +454,11 @@ def run_pipeline(
             enriched_products_count,
             skipped_products_count,
         )
+        if partial_failure_count > 0:
+            logger.warning(
+                "⚠️  %d products had partial failures (some operations failed but others succeeded).",
+                partial_failure_count,
+            )
         logger.info("==================================================")
 
     except Exception as exc:

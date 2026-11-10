@@ -9,6 +9,7 @@ from config import (
     HASH_PRODUCT_ABOUT_PAGE,
     HASH_PRODUCT_BUILT_WITH_PAGE,
     HASH_PRODUCT_COMMENTS,
+    HASH_PRODUCT_MAKERS,
     HASH_PRODUCTS_PAGE_LAYOUT,
     settings,
 )
@@ -45,12 +46,18 @@ def fetch_daily_leaderboard(
         logger.warning("No Leaderboard hash configured. Automatically launching hash extractor...")
         try:
             from extract_hashes import extract_hashes_and_cookies
+            from importlib import reload
+            import config as _config_mod
+            
             extracted, cookies, ua = extract_hashes_and_cookies()
             hash_to_use = extracted.get("LeaderboardDailyPage")
             if cookies:
                 client.client.headers["Cookie"] = cookies
             if ua:
                 client.client.headers["User-Agent"] = ua
+            
+            # Reload settings to pick up the updated .env values
+            reload(_config_mod)
         except Exception as exc:
             logger.error("Auto extraction failed: %s", exc)
 
@@ -141,7 +148,13 @@ def enrich_product(
     product_slug: str,
     product_id_hint: str = "",
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Retrieve detailed product information, about/media, makers, and built-with data."""
+    """Retrieve detailed product information, makers, and built-with data.
+
+    Uses:
+      - ProductsPageLayout  → product details + social links
+      - ProductPageMakers   → makers/team members (new operation replacing ProductAboutPage)
+      - ProductBuiltWithPage → built-with / shoutouts
+    """
     logger.info("Enriching product details for slug: %s", product_slug)
 
     product_data: Dict[str, Any] = {}
@@ -149,77 +162,76 @@ def enrich_product(
     people: List[Dict[str, Any]] = []
     built_with: List[Dict[str, Any]] = []
 
-    # 1. Product Layout / Details (with retry to ensure no missed data)
+    # 1. Product Layout / Details
     for attempt in range(1, 4):
         try:
-            layout_vars = {
-                "slug": product_slug,
-                "includeAlternatives": True,
-                "launchSlug": None,
-            }
             layout_resp = client.execute_query(
                 operation_name="ProductsPageLayout",
-                variables=layout_vars,
+                variables={
+                    "slug": product_slug,
+                    "includeAlternatives": True,
+                    "launchSlug": None,
+                },
                 sha256_hash=HASH_PRODUCTS_PAGE_LAYOUT,
             )
             product_data = parse_product_layout(layout_resp)
             break
         except Exception as exc:
-            logger.warning(
-                "Failed to fetch layout for product %s (attempt %d/3): %s",
-                product_slug,
-                attempt,
-                exc,
-            )
+            logger.warning("Failed to fetch layout for %s (attempt %d/3): %s", product_slug, attempt, exc)
             time.sleep(1.0 * attempt)
 
-    # Use resolved product_id or hint
     resolved_product_id = product_data.get("product_id") or product_id_hint
 
-    # 2. Product About (media, makers, hunters, pricing)
+    # 2. Makers — ProductPageMakers (paginated, edges format)
     for attempt in range(1, 4):
         try:
-            about_vars = {"productSlug": product_slug}
-            about_resp = client.execute_query(
-                operation_name="ProductAboutPage",
-                variables=about_vars,
-                sha256_hash=HASH_PRODUCT_ABOUT_PAGE,
+            makers_resp = client.execute_query(
+                operation_name="ProductPageMakers",
+                variables={"slug": product_slug, "cursor": None},
+                sha256_hash=HASH_PRODUCT_MAKERS,
             )
-            media_items, people, about_info = parse_product_about(
-                about_resp,
-                product_id=resolved_product_id,
-                product_slug=product_slug,
-            )
-            if about_info:
-                product_data.update(about_info)
+            makers_data = makers_resp.get("data", {}).get("product", {})
+            # Extract from edges format
+            makers_raw = makers_data.get("makers", {})
+            if isinstance(makers_raw, dict):
+                edges = makers_raw.get("edges", [])
+            elif isinstance(makers_raw, list):
+                edges = [{"node": m} for m in makers_raw]
+            else:
+                edges = []
+
+            for edge in edges:
+                node = edge.get("node", {}) if isinstance(edge, dict) else {}
+                if not node or not isinstance(node, dict):
+                    continue
+                username = node.get("username", "")
+                if username:
+                    people.append({
+                        "product_id": resolved_product_id,
+                        "user_id": str(node.get("id", "")),
+                        "username": username,
+                        "name": node.get("name", ""),
+                        "headline": node.get("headline", ""),
+                        "avatar_url": node.get("avatarUrl") or node.get("profileImage") or "",
+                        "role": "maker",
+                    })
             break
         except Exception as exc:
-            logger.warning(
-                "Failed to fetch about page for product %s (attempt %d/3): %s",
-                product_slug,
-                attempt,
-                exc,
-            )
+            logger.warning("Failed to fetch makers for %s (attempt %d/3): %s", product_slug, attempt, exc)
             time.sleep(1.0 * attempt)
 
     # 3. Product Built With
     for attempt in range(1, 4):
         try:
-            bw_vars = {"slug": product_slug}
             bw_resp = client.execute_query(
                 operation_name="ProductBuiltWithPage",
-                variables=bw_vars,
+                variables={"slug": product_slug},
                 sha256_hash=HASH_PRODUCT_BUILT_WITH_PAGE,
             )
             built_with = parse_product_built_with(bw_resp, product_id=resolved_product_id)
             break
         except Exception as exc:
-            logger.warning(
-                "Failed to fetch built-with for product %s (attempt %d/3): %s",
-                product_slug,
-                attempt,
-                exc,
-            )
+            logger.warning("Failed to fetch built-with for %s (attempt %d/3): %s", product_slug, attempt, exc)
             time.sleep(1.0 * attempt)
 
     return product_data, media_items, people, built_with
@@ -326,10 +338,11 @@ def fetch_product_reviews(
     # Step 2: Fetch review feed with pagination and retry per page
     cursor: Optional[str] = None
     page = 1
+    MAX_REVIEWS = 500  # hard cap to avoid runaway pagination
     while True:
         variables: Dict[str, Any] = {
             "slug": product_slug,
-            "reviewsLimit": 10,
+            "reviewsLimit": 10,   # keep at 10 — PH GraphQL complexity limit rejects higher values
             "commentsListSubjectThreadsLimit": 10,
         }
         if cursor:
@@ -356,6 +369,9 @@ def fetch_product_reviews(
 
                 if not has_next or not end_cursor or end_cursor == cursor:
                     logger.info("Retrieved %d unique reviews for product_slug: %s", len(all_reviews), product_slug)
+                    return all_reviews, discovered_users
+                if len(all_reviews) >= MAX_REVIEWS:
+                    logger.info("Reached MAX_REVIEWS cap (%d) for %s", MAX_REVIEWS, product_slug)
                     return all_reviews, discovered_users
                 cursor = end_cursor
                 page += 1

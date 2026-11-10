@@ -2,12 +2,18 @@
 
 import json
 import time
+from threading import Lock
 from typing import Any, Dict, Optional
 import httpx
 from config import settings
 from utils import get_logger
 
 logger = get_logger(__name__, settings.log_level)
+
+# Global rate limiter lock shared across all GraphQLClient instances
+# This ensures that concurrent threads respect the delay between ANY requests
+_global_rate_limit_lock = Lock()
+_global_last_request_time = 0.0
 
 
 class GraphQLClient:
@@ -47,12 +53,22 @@ class GraphQLClient:
         self.client = httpx.Client(headers=headers, timeout=self.timeout)
 
     def _apply_delay(self) -> None:
-        """Enforce rate limiting delay between consecutive requests."""
+        """Enforce rate limiting delay between consecutive requests.
+        
+        Uses a global lock to ensure that ALL threads (in concurrent processing)
+        respect the minimum delay between ANY API requests, not just per-client.
+        """
+        global _global_last_request_time
+        
         if self.delay <= 0:
             return
-        elapsed = time.time() - self._last_request_time
-        if elapsed < self.delay:
-            time.sleep(self.delay - elapsed)
+        
+        with _global_rate_limit_lock:
+            elapsed = time.time() - _global_last_request_time
+            if elapsed < self.delay:
+                wait_time = self.delay - elapsed
+                time.sleep(wait_time)
+            _global_last_request_time = time.time()
 
     def execute_query(
         self,
@@ -90,7 +106,10 @@ class GraphQLClient:
                     self.max_retries + 1,
                 )
                 response = self.client.get(self.base_url, params=params)
-                self._last_request_time = time.time()
+                
+                # Update global last request time (already updated in _apply_delay, but ensure consistency)
+                global _global_last_request_time
+                _global_last_request_time = time.time()
 
                 # Handle Rate Limiting (429) with Exponential Backoff up to max_retries
                 if response.status_code == 429:
@@ -103,16 +122,19 @@ class GraphQLClient:
                         retry_after = float(retry_header) if retry_header else 0.0
                     except ValueError:
                         retry_after = 0.0
+                    
+                    # Use the larger of: Retry-After header or exponential backoff
                     wait_time = max(retry_after, backoff)
+                    
                     logger.warning(
-                        "Rate limited (429) on %s (attempt %d/%d). Exponential backoff: waiting %.1fs...",
+                        "⚠️  Rate limited (429) on %s (attempt %d/%d). Backing off for %.1fs before retry...",
                         operation_name,
                         attempt,
-                        self.max_retries,
+                        self.max_retries + 1,
                         wait_time,
                     )
                     time.sleep(wait_time)
-                    backoff = min(backoff * 2, 60.0)
+                    backoff = min(backoff * 2, 120.0)  # Cap at 2 minutes
                     continue
 
                 # Handle 403 Forbidden (Cloudflare session refresh)
